@@ -861,8 +861,8 @@ class SilentBridge:
             
         try:
             if action == 'unmanage':
-                # First check if interface is managed by NetworkManager
-                result = self.run_command(f"nmcli device status | grep {interface}")
+                # First check if interface is managed by NetworkManager using shell=True
+                result = self.run_command(f"nmcli device status | grep {interface}", shell=True)
                 if not result or 'unmanaged' in result:
                     return True
                     
@@ -885,15 +885,15 @@ class SilentBridge:
     def reset_interface(self, interface):
         """Reset an interface to a clean state"""
         try:
+            # Remove from NetworkManager if present first
+            if self.network_stack['networkmanager']:
+                self.handle_networkmanager_interface(interface, 'unmanage')
+            
             # Bring interface down
             if self.network_stack['ip']:
                 self.run_command(f"ip link set {interface} down", ignore_errors=True)
             else:
                 self.run_command(f"ifconfig {interface} down", ignore_errors=True)
-            
-            # Remove from NetworkManager if present
-            if self.network_stack['networkmanager']:
-                self.handle_networkmanager_interface(interface, 'unmanage')
             
             # Flush IP addresses
             if self.network_stack['ip']:
@@ -901,6 +901,15 @@ class SilentBridge:
             
             # Reset interface flags
             self.run_command(f"ip link set {interface} promisc off", ignore_errors=True)
+            
+            # Bring interface back up for packet capture
+            if self.network_stack['ip']:
+                self.run_command(f"ip link set {interface} up", ignore_errors=True)
+            else:
+                self.run_command(f"ifconfig {interface} up", ignore_errors=True)
+            
+            # Small delay to ensure interface is up
+            time.sleep(1)
             
             return True
         except Exception as e:
@@ -945,8 +954,20 @@ class SilentBridge:
                 if not self.reset_interface(iface):
                     raise Exception(f"Failed to reset interface {iface}")
             
-            print("[*] Waiting 10 seconds for interfaces to settle...")
-            time.sleep(10)
+            print("[*] Waiting 5 seconds for interfaces to settle...")
+            time.sleep(5)  # Reduced from 10 to 5 since we're already waiting in reset_interface
+            
+            # Verify interfaces are up before starting capture
+            for iface in self.args.interfaces:
+                if self.network_stack['ip']:
+                    state = self.run_command(f"ip link show {iface}", shell=True)
+                    if state and "DOWN" in state:
+                        print(f"[*] Bringing up {iface}...")
+                        self.run_command(f"ip link set {iface} up", ignore_errors=True)
+                        time.sleep(1)
+                else:
+                    self.run_command(f"ifconfig {iface} up", ignore_errors=True)
+                    time.sleep(1)
             
             # Step 2: Analyze network to determine interfaces
             print("[*] Starting network analysis...")
@@ -959,15 +980,30 @@ class SilentBridge:
             )
             self.args = analysis_args
             
-            # Start packet capture
+            # Clear any existing packets
+            while not self.packet_queue.empty():
+                self.packet_queue.get()
+            
+            self.stop_sniffing.clear()
+            
+            # Start packet capture with error handling
             threads = []
             for iface in self.args.interfaces:
-                thread = Thread(target=lambda: sniff(
-                    iface=iface,
-                    prn=self.packet_callback,
-                    store=0,
-                    stop_filter=lambda _: self.stop_sniffing.is_set()
-                ))
+                def sniff_with_retry(iface):
+                    while not self.stop_sniffing.is_set():
+                        try:
+                            sniff(iface=iface,
+                                 prn=self.packet_callback,
+                                 store=0,
+                                 stop_filter=lambda _: self.stop_sniffing.is_set())
+                        except OSError as e:
+                            if e.errno == 100:  # Network is down
+                                print(f"[!] Interface {iface} is down, retrying...")
+                                time.sleep(1)
+                                continue
+                            raise
+                
+                thread = Thread(target=sniff_with_retry, args=(iface,))
                 thread.daemon = True
                 thread.start()
                 threads.append(thread)
