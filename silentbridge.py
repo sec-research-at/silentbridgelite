@@ -25,8 +25,8 @@ class SilentBridge:
         # Create bridge command
         create_parser = subparsers.add_parser('create', help='Create a transparent bridge')
         create_parser.add_argument('--bridge', required=True, help='Bridge interface name')
-        create_parser.add_argument('--phy', required=True, help='Physical interface connected to the network')
-        create_parser.add_argument('--upstream', required=True, help='Upstream interface')
+        create_parser.add_argument('--phy', required=True, help='Interface connected to the client (the computer that authenticates itself)')
+        create_parser.add_argument('--upstream', required=True, help='Upstream interface - The interface connected to the network/router')
         create_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
         create_parser.add_argument('--egress-port', type=int, default=22, help='Egress port for side channel')
         create_parser.add_argument('--use-legacy', action='store_true', help='Use legacy iptables instead of nf_tables')
@@ -38,7 +38,7 @@ class SilentBridge:
         # Add interaction command
         interact_parser = subparsers.add_parser('interact', help='Add interaction to bridge')
         interact_parser.add_argument('--bridge', required=True, help='Bridge interface name')
-        interact_parser.add_argument('--phy', required=True, help='Physical interface connected to the network')
+        interact_parser.add_argument('--phy', required=True, help='Interface connected to the client (the computer that authenticates itself)')
         interact_parser.add_argument('--upstream', required=True, help='Upstream interface')
         interact_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
         interact_parser.add_argument('--egress-port', type=int, default=22, help='Egress port for side channel')
@@ -128,6 +128,12 @@ class SilentBridge:
             return False
         
         try:
+            # Handle hexadecimal values properly
+            if isinstance(value, str) and value.startswith("0x"):
+                # Convert hex string to integer
+                int_value = int(value, 16)
+                value = str(int_value)
+            
             with open(path, 'w') as f:
                 f.write(str(value))
             return True
@@ -156,12 +162,23 @@ class SilentBridge:
         self.run_command(f"ip link set {bridge_name} promisc on", ignore_errors=True)
         
         # Set group_fwd_mask to forward all BPDUs and other reserved addresses
+        # Try different methods to set this value
         if os.path.exists(f"/sys/class/net/{bridge_name}/bridge/group_fwd_mask"):
-            self.write_sysfs(f"/sys/class/net/{bridge_name}/bridge/group_fwd_mask", "0xffff")
+            try:
+                # Try direct command first
+                self.run_command(f"echo 65535 > /sys/class/net/{bridge_name}/bridge/group_fwd_mask", shell=True, ignore_errors=True)
+            except:
+                # Then try our write_sysfs method
+                self.write_sysfs(f"/sys/class/net/{bridge_name}/bridge/group_fwd_mask", "65535")
         
         # Disable IGMP snooping if available
         if os.path.exists(f"/sys/devices/virtual/net/{bridge_name}/bridge/multicast_igmp_version"):
-            self.write_sysfs(f"/sys/devices/virtual/net/{bridge_name}/bridge/multicast_igmp_version", "0")
+            try:
+                # Try direct command first
+                self.run_command(f"echo 0 > /sys/devices/virtual/net/{bridge_name}/bridge/multicast_igmp_version", shell=True, ignore_errors=True)
+            except:
+                # Then try our write_sysfs method
+                self.write_sysfs(f"/sys/devices/virtual/net/{bridge_name}/bridge/multicast_igmp_version", "0")
         
         # Disable bridge learning
         if os.path.exists(f"/sys/devices/virtual/net/{bridge_name}/brif"):
@@ -239,7 +256,12 @@ class SilentBridge:
         # Enable 802.1x forwarding
         print("[*] Enabling 802.1x forwarding...")
         if os.path.exists(f"/sys/class/net/{self.args.bridge}/bridge/group_fwd_mask"):
-            self.write_sysfs(f"/sys/class/net/{self.args.bridge}/bridge/group_fwd_mask", "8")
+            try:
+                # Try direct command first
+                self.run_command(f"echo 8 > /sys/class/net/{self.args.bridge}/bridge/group_fwd_mask", shell=True, ignore_errors=True)
+            except:
+                # Then try our write_sysfs method
+                self.write_sysfs(f"/sys/class/net/{self.args.bridge}/bridge/group_fwd_mask", "8")
         
         # Enable IP forwarding
         print("[*] Enabling IP forwarding...")
