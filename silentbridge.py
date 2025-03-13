@@ -37,16 +37,18 @@ class SilentBridge:
         
         subparsers = parser.add_subparsers(dest='command', help='Commands')
         
+        # Install tools command
+        install_parser = subparsers.add_parser('install-tools', help='Check and install required tools')
+        install_parser.add_argument('--no-confirm', action='store_true', help='Skip confirmation before installing packages')
+        
         # Analyze command
         analyze_parser = subparsers.add_parser('analyze', help='Analyze network interfaces and detect configuration')
         analyze_parser.add_argument('--interfaces', nargs='+', required=True, help='List of interfaces to analyze')
         analyze_parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds for analysis')
-        analyze_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
         
         # Autotakeover command
         autotakeover_parser = subparsers.add_parser('autotakeover', help='Automatically analyze, bridge and takeover client connection')
         autotakeover_parser.add_argument('--interfaces', nargs=2, required=True, help='Two ethernet interfaces to use')
-        autotakeover_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
         autotakeover_parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds for analysis')
         autotakeover_parser.add_argument('--bridge', default='br0', help='Bridge interface name')
         autotakeover_parser.add_argument('--veth-name', default='veth0', help='Name for the virtual ethernet device')
@@ -56,8 +58,6 @@ class SilentBridge:
         create_parser.add_argument('--bridge', required=True, help='Bridge interface name')
         create_parser.add_argument('--phy', help='Interface connected to the client (the computer that authenticates itself)')
         create_parser.add_argument('--upstream', help='Upstream interface - The interface connected to the network/router')
-        create_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
-        create_parser.add_argument('--egress-port', type=int, default=22, help='Egress port for side channel')
         create_parser.add_argument('--use-legacy', action='store_true', help='Use legacy iptables instead of nf_tables')
         create_parser.add_argument('--use-stored-config', action='store_true', help='Use stored configuration from previous analysis')
         
@@ -70,8 +70,6 @@ class SilentBridge:
         interact_parser.add_argument('--bridge', required=True, help='Bridge interface name')
         interact_parser.add_argument('--phy', required=True, help='Interface connected to the client (the computer that authenticates itself)')
         interact_parser.add_argument('--upstream', required=True, help='Upstream interface')
-        interact_parser.add_argument('--sidechannel', required=True, help='Side channel interface for management')
-        interact_parser.add_argument('--egress-port', type=int, default=22, help='Egress port for side channel')
         interact_parser.add_argument('--client-mac', required=True, help='Client MAC address to impersonate')
         interact_parser.add_argument('--client-ip', required=True, help='Client IP address to impersonate')
         interact_parser.add_argument('--gw-mac', required=True, help='Gateway MAC address')
@@ -97,7 +95,9 @@ class SilentBridge:
     def run(self):
         self.args = self.parser.parse_args()
         
-        if self.args.command == 'analyze':
+        if self.args.command == 'install-tools':
+            self.install_tools()
+        elif self.args.command == 'analyze':
             self.analyze_network()
         elif self.args.command == 'create':
             # If using stored config, load it
@@ -248,7 +248,7 @@ class SilentBridge:
         print("[*] Creating transparent bridge...")
         
         # Check if interfaces exist
-        for iface in [self.args.phy, self.args.upstream, self.args.sidechannel]:
+        for iface in [self.args.phy, self.args.upstream]:
             if not self.check_interface_exists(iface):
                 print(f"[!] Interface {iface} does not exist!")
                 return
@@ -330,9 +330,6 @@ class SilentBridge:
         # Initiate radio silence
         print("[*] Initiating radio silence...")
         try:
-            self.run_command(f"{iptables_cmd} -A OUTPUT -o {self.args.sidechannel} -p tcp --dport {self.args.egress_port} -j ACCEPT", ignore_errors=True)
-            self.run_command(f"{iptables_cmd} -I INPUT -i {self.args.sidechannel} -m state --state ESTABLISHED,RELATED -j ACCEPT", ignore_errors=True)
-            self.run_command(f"{arptables_cmd} -A OUTPUT -o {self.args.sidechannel} -j ACCEPT", ignore_errors=True)
             self.run_command(f"{iptables_cmd} -A OUTPUT -j DROP", ignore_errors=True)
             self.run_command(f"{arptables_cmd} -A OUTPUT -j DROP", ignore_errors=True)
         except Exception as e:
@@ -439,7 +436,7 @@ class SilentBridge:
             return
         
         # Check if interfaces exist
-        for iface in [self.args.phy, self.args.upstream, self.args.sidechannel]:
+        for iface in [self.args.phy, self.args.upstream]:
             if not self.check_interface_exists(iface):
                 print(f"[!] Interface {iface} does not exist!")
                 return
@@ -494,9 +491,6 @@ class SilentBridge:
         # Initiate radio silence
         print("[*] Initiating radio silence...")
         try:
-            self.run_command(f"{iptables_cmd} -A OUTPUT -o {self.args.sidechannel} -p tcp --dport {self.args.egress_port} -j ACCEPT", ignore_errors=True)
-            self.run_command(f"{iptables_cmd} -I INPUT -i {self.args.sidechannel} -m state --state ESTABLISHED,RELATED -j ACCEPT", ignore_errors=True)
-            self.run_command(f"{arptables_cmd} -A OUTPUT -o {self.args.sidechannel} -j ACCEPT", ignore_errors=True)
             self.run_command(f"{iptables_cmd} -A OUTPUT -j DROP", ignore_errors=True)
             self.run_command(f"{arptables_cmd} -A OUTPUT -j DROP", ignore_errors=True)
         except Exception as e:
@@ -975,8 +969,7 @@ class SilentBridge:
             original_args = self.args
             analysis_args = argparse.Namespace(
                 interfaces=self.args.interfaces,
-                timeout=self.args.timeout,
-                sidechannel=self.args.sidechannel
+                timeout=self.args.timeout
             )
             self.args = analysis_args
             
@@ -1032,8 +1025,6 @@ class SilentBridge:
                 bridge=self.args.bridge,
                 phy=config['phy_interface'],
                 upstream=config['upstream_interface'],
-                sidechannel=self.args.sidechannel,
-                egress_port=22,
                 use_legacy=False
             )
             self.args = bridge_args
@@ -1104,6 +1095,192 @@ class SilentBridge:
         finally:
             # Restore original args
             self.args = original_args
+
+    def detect_package_manager(self):
+        """Detect the system's package manager"""
+        package_managers = {
+            'apt': '/usr/bin/apt',
+            'yum': '/usr/bin/yum',
+            'dnf': '/usr/bin/dnf',
+            'pacman': '/usr/bin/pacman',
+            'zypper': '/usr/bin/zypper',
+            'apk': '/sbin/apk'
+        }
+        
+        for pm, path in package_managers.items():
+            if os.path.exists(path):
+                return pm
+        return None
+
+    def get_package_names(self, package_manager):
+        """Get package names for different package managers"""
+        packages = {
+            'apt': {
+                'python3-pip': 'python3-pip',
+                'bridge-utils': 'bridge-utils',
+                'macchanger': 'macchanger',
+                'ethtool': 'ethtool',
+                'net-tools': 'net-tools',
+                'iptables': 'iptables',
+                'ebtables': 'ebtables',
+                'arptables': 'arptables'
+            },
+            'yum': {
+                'python3-pip': 'python3-pip',
+                'bridge-utils': 'bridge-utils',
+                'macchanger': 'macchanger',
+                'ethtool': 'ethtool',
+                'net-tools': 'net-tools',
+                'iptables': 'iptables',
+                'ebtables': 'ebtables',
+                'arptables': 'arptables'
+            },
+            'dnf': {
+                'python3-pip': 'python3-pip',
+                'bridge-utils': 'bridge-utils',
+                'macchanger': 'macchanger',
+                'ethtool': 'ethtool',
+                'net-tools': 'net-tools',
+                'iptables': 'iptables',
+                'ebtables': 'ebtables',
+                'arptables': 'arptables'
+            },
+            'pacman': {
+                'python3-pip': 'python-pip',
+                'bridge-utils': 'bridge-utils',
+                'macchanger': 'macchanger',
+                'ethtool': 'ethtool',
+                'net-tools': 'net-tools',
+                'iptables': 'iptables',
+                'ebtables': 'ebtables',
+                'arptables': 'arptables'
+            },
+            'zypper': {
+                'python3-pip': 'python3-pip',
+                'bridge-utils': 'bridge-utils',
+                'macchanger': 'macchanger',
+                'ethtool': 'ethtool',
+                'net-tools': 'net-tools',
+                'iptables': 'iptables',
+                'ebtables': 'ebtables',
+                'arptables': 'arptables'
+            },
+            'apk': {
+                'python3-pip': 'py3-pip',
+                'bridge-utils': 'bridge-utils',
+                'macchanger': 'macchanger',
+                'ethtool': 'ethtool',
+                'net-tools': 'net-tools',
+                'iptables': 'iptables',
+                'ebtables': 'ebtables',
+                'arptables': 'arptables'
+            }
+        }
+        return packages.get(package_manager, {})
+
+    def get_install_command(self, package_manager):
+        """Get the installation command for different package managers"""
+        commands = {
+            'apt': 'apt-get -y install',
+            'yum': 'yum -y install',
+            'dnf': 'dnf -y install',
+            'pacman': 'pacman -S --noconfirm',
+            'zypper': 'zypper -n install',
+            'apk': 'apk add'
+        }
+        return commands.get(package_manager)
+
+    def check_python_package(self, package):
+        """Check if a Python package is installed"""
+        try:
+            __import__(package)
+            return True
+        except ImportError:
+            return False
+
+    def install_tools(self):
+        """Check and install required tools"""
+        print("[*] Checking for required tools...")
+        
+        # Check if running as root
+        if os.geteuid() != 0:
+            print("[!] This command must be run as root!")
+            return
+        
+        # Detect package manager
+        package_manager = self.detect_package_manager()
+        if not package_manager:
+            print("[!] Could not detect package manager!")
+            return
+        
+        print(f"[*] Detected package manager: {package_manager}")
+        
+        # Get package names for detected package manager
+        packages = self.get_package_names(package_manager)
+        if not packages:
+            print(f"[!] Package manager {package_manager} is not supported!")
+            return
+        
+        # Check which packages are missing
+        missing_packages = []
+        for tool, package in packages.items():
+            if not self.check_command_exists(tool.split('-')[0]):  # Handle cases like python3-pip
+                missing_packages.append(package)
+        
+        # Check Python packages
+        python_packages = ['scapy', 'netifaces']
+        missing_python_packages = []
+        for package in python_packages:
+            if not self.check_python_package(package):
+                missing_python_packages.append(package)
+        
+        if not missing_packages and not missing_python_packages:
+            print("[+] All required tools are already installed!")
+            return
+        
+        # Print missing packages
+        if missing_packages:
+            print("\nMissing system packages:")
+            for package in missing_packages:
+                print(f"  - {package}")
+        
+        if missing_python_packages:
+            print("\nMissing Python packages:")
+            for package in missing_python_packages:
+                print(f"  - {package}")
+        
+        # Ask for confirmation
+        if not self.args.no_confirm:
+            response = input("\nDo you want to install the missing packages? [y/N] ")
+            if response.lower() != 'y':
+                print("[*] Installation cancelled.")
+                return
+        
+        # Install missing system packages
+        if missing_packages:
+            print("\n[*] Installing missing system packages...")
+            install_cmd = self.get_install_command(package_manager)
+            packages_str = ' '.join(missing_packages)
+            
+            if package_manager == 'pacman':
+                # Update package database first for Arch Linux
+                self.run_command("pacman -Sy", ignore_errors=True)
+            
+            result = self.run_command(f"{install_cmd} {packages_str}")
+            if result is None:
+                print("[!] Failed to install system packages!")
+                return
+        
+        # Install missing Python packages
+        if missing_python_packages:
+            print("\n[*] Installing missing Python packages...")
+            packages_str = ' '.join(missing_python_packages)
+            result = self.run_command(f"pip3 install {packages_str}")
+            if result is None:
+                print("[!] Failed to install Python packages!")
+                return
+        
+        print("\n[+] All required tools have been installed successfully!")
 
 if __name__ == "__main__":
     bridge = SilentBridge()

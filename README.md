@@ -1,109 +1,161 @@
-# SilentBridge Python 3.x
+# SilentBridge
 
-A modern Python 3.x implementation of the core functionality from the SilentBridge toolkit for 802.1x port security bypass.
+SilentBridge is a powerful 802.1x bypass tool that creates a transparent bridge between a client and network, allowing for network analysis and authentication bypass.
 
-## Overview
+## Features
 
-This script provides the core functionality needed to:
-- Create a transparent bridge for 802.1x bypass
-- Reset/destroy a bridge
-- Add interaction to a bridge (for traffic manipulation)
-- Force 802.1x reauthentication via EAPOL-Start packets
-- Take over a client's connection by creating a virtual interface
+- Automatic network analysis and configuration detection
+- Support for both modern (NetworkManager, ip) and legacy (ifconfig, brctl) network stacks
+- Transparent bridge creation with complete packet forwarding
+- Client connection takeover with virtual interface
+- Interactive mode for manual network manipulation
+- Automatic cleanup and state restoration on failure
+- Support for 802.1x reauthentication forcing
+- Automatic tool installation for multiple package managers
 
 ## Requirements
 
 - Python 3.6+
-- Root/sudo privileges
-- Linux system with the following tools installed:
-  - `brctl` (bridge-utils)
-  - `iptables`
-  - `ebtables`
-  - `arptables`
-  - `macchanger`
-  - `ethtool`
-  - `ip` (iproute2)
+- Root privileges
 
-## Installation
+You can automatically install all required tools using:
+```bash
+sudo python3 silentbridge.py install-tools
+```
 
-1. Install the required Python packages:
-   ```
-   pip3 install -r requirements.txt
-   ```
+This will check for and install:
+- System packages (using your system's package manager):
+  - python3-pip
+  - bridge-utils
+  - macchanger
+  - ethtool
+  - net-tools
+  - iptables
+  - ebtables
+  - arptables
+- Python packages:
+  - scapy
+  - netifaces
 
-2. Make the script executable:
-   ```
-   chmod +x silentbridge.py
-   ```
+Supported package managers:
+- apt (Debian/Ubuntu)
+- yum (RHEL/CentOS)
+- dnf (Fedora)
+- pacman (Arch Linux)
+- zypper (openSUSE)
+- apk (Alpine Linux)
 
 ## Usage
 
-The script provides several commands for different operations:
+### Automatic Takeover (Recommended)
 
-### Create a Transparent Bridge
-
-```bash
-sudo ./silentbridge.py create --bridge br0 --phy eth1 --upstream eth2 --sidechannel eth0 --egress-port 22
-```
-
-This creates a transparent bridge named `br0` with `eth1` (physical interface connected to the network) and `eth2` (upstream interface) as slaves. The `eth0` interface is used as a side channel for management access.
-
-### Destroy a Bridge
+The easiest way to use SilentBridge is with the autotakeover command:
 
 ```bash
-sudo ./silentbridge.py destroy --bridge br0
+python3 silentbridge.py autotakeover --interfaces eth0 eth1
 ```
 
-This destroys the bridge named `br0` and frees all its slave interfaces.
+This will:
+1. Analyze the network to determine which interface is connected to the client and which to the network
+2. Create a transparent bridge
+3. Capture client authentication
+4. Take over the client's connection
 
-### Add Interaction to a Bridge
+### Manual Commands
+
+#### Analyze Network
+
+Analyze interfaces to determine configuration:
 
 ```bash
-sudo ./silentbridge.py interact --bridge br0 --phy eth1 --upstream eth2 --sidechannel eth0 --egress-port 22 --client-mac 00:11:22:33:44:55 --client-ip 192.168.1.100 --gw-mac 00:aa:bb:cc:dd:ee
+python3 silentbridge.py analyze --interfaces eth0 eth1
 ```
 
-This adds interaction capabilities to the bridge, allowing you to impersonate a client with the specified MAC and IP addresses.
+#### Create Bridge
 
-### Force 802.1x Reauthentication
+Create a transparent bridge (with optional stored config):
 
 ```bash
-sudo ./silentbridge.py reauth --interface eth1 --client-mac 00:11:22:33:44:55
+python3 silentbridge.py create --bridge br0 --phy eth0 --upstream eth1
+# Or using stored configuration:
+python3 silentbridge.py create --bridge br0 --use-stored-config
 ```
 
-This sends an EAPOL-Start packet from the specified interface, impersonating the client with the given MAC address, to force 802.1x reauthentication.
+#### Add Interaction
 
-### Take Over Client Connection
+Add interaction capabilities to the bridge:
 
 ```bash
-sudo ./silentbridge.py takeover --bridge br0 --phy eth1 --client-mac 00:11:22:33:44:55 --client-ip 192.168.1.100 --gateway-ip 192.168.1.1 --veth-name veth0
+python3 silentbridge.py interact --bridge br0 --phy eth0 --upstream eth1 \
+                               --client-mac 00:11:22:33:44:55 --client-ip 192.168.1.100 \
+                               --gw-mac 00:11:22:33:44:66
 ```
 
-This command removes the physical interface from the bridge and creates a virtual Ethernet device with the client's MAC and IP address. The client is effectively disconnected from the network, and the system takes over the client's connection. This allows direct access to the network using the client's identity without the need for NAT or other traffic manipulation techniques.
+#### Force Reauthentication
+
+Force 802.1x reauthentication:
+
+```bash
+python3 silentbridge.py reauth --interface eth0 --client-mac 00:11:22:33:44:55
+```
+
+#### Take Over Client
+
+Take over a client's connection:
+
+```bash
+python3 silentbridge.py takeover --bridge br0 --phy eth0 --client-mac 00:11:22:33:44:55 \
+                                --client-ip 192.168.1.100 --gateway-ip 192.168.1.1
+```
+
+#### Destroy Bridge
+
+Clean up and destroy the bridge:
+
+```bash
+python3 silentbridge.py destroy --bridge br0
+```
+
+## Configuration
+
+SilentBridge automatically saves detected configurations to `~/.silentbridge`. This configuration can be reused with the `--use-stored-config` option.
+
+## Network Stack Support
+
+SilentBridge automatically detects and uses the appropriate network stack:
+
+- Modern systems:
+  - NetworkManager
+  - ip command (iproute2)
+  - bridge command
+- Legacy systems:
+  - ifconfig
+  - brctl
+  - route
+
+## Troubleshooting
+
+1. If interfaces are not detected:
+   - Ensure you have the correct permissions (run as root)
+   - Check if interfaces are managed by NetworkManager
+   - Verify interface names are correct
+
+2. If bridge creation fails:
+   - Ensure bridge-utils is installed
+   - Check if interfaces are already in use
+   - Verify kernel modules (br_netfilter) are available
+
+3. If packet capture fails:
+   - Ensure Scapy is installed correctly
+   - Check if interfaces are up
+   - Verify promiscuous mode is supported
 
 ## Security Considerations
 
-This tool is intended for legitimate security testing and research purposes only. Unauthorized use of this tool on networks you do not own or have explicit permission to test is illegal and unethical.
-
-## Acknowledgments
-
-This project is a modern Python 3.x reimplementation of the original SilentBridge toolkit created by Gabriel Ryan ([@s0lst1c3](https://twitter.com/s0lst1c3)) at SpecterOps. The original project was first presented at DEF CON 26 and provided the first documented means of bypassing 802.1x-2010 via its authentication process, as well as improvements to existing techniques for bypassing 802.1x-2004.
-
-The original SilentBridge project either builds upon, is inspired by, or directly incorporates over ten years of prior research and development from the following researchers:
-
-- Steve Riley - Hub-based 802.1x-2004 bypass
-- Alva Duckwall - Bridge-based 802.1x-2004 bypass
-- Abb - Tap-based 802.1x-2004 bypass
-- Valerian Legrand - Injection-based 802.1x-2004 bypass
-- Josh Wright and Brad Antoniewicz - Attacks Against Weak EAP Methods
-- Dom White and Ian de Villier - More Attacks Against Weak EAP Methods
-- Moxie Marlinspike and David Hulton - Attacks Against MS-CHAPv2
-
-For more information about the original research, you can check out the accompanying whitepaper at [Bypassing Port Security In 2018 - Defeating MACsec and 802.1x-2010](https://www.researchgate.net/publication/327402715_Bypassing_Port_Security_In_2018_-_Defeating_MACsec_and_8021x-2010).
+- This tool is for educational and testing purposes only
+- Always obtain proper authorization before testing
+- The tool creates a transparent bridge that can intercept all traffic
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0, the same license as the original SilentBridge toolkit. The full text of the license can be found in the `LICENSE` file.
-
-## Disclaimer
-
-This tool is provided for educational and research purposes only. The author is not responsible for any misuse or damage caused by this tool. 
+This project is for educational purposes only. Use responsibly and only on networks you own or have explicit permission to test.
