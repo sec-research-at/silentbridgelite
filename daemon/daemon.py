@@ -564,20 +564,34 @@ class SilentBridgeDaemon:
 
 def install_service():
     """Install SilentBridge as a system service"""
-    # Get the absolute path of the script
+    # Get the absolute path of the script and its directory
     script_path = os.path.abspath(__file__)
+    work_dir = os.path.dirname(os.path.dirname(script_path))
     
     # Create systemd service file
     service_content = f"""[Unit]
 Description=SilentBridge Daemon
 After=network.target
+Wants=network-online.target
+Documentation=https://github.com/yourusername/silentbridgelite
 
 [Service]
 Type=forking
 ExecStart={sys.executable} {script_path}
 PIDFile={DEFAULT_PID_FILE}
+WorkingDirectory={work_dir}
 Restart=on-failure
+RestartSec=5
 User=root
+Group=root
+# Security settings
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# Capabilities
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
@@ -592,13 +606,28 @@ WantedBy=multi-user.target
         # Set correct permissions
         os.chmod(service_path, 0o644)
         
+        # Create required directories if they don't exist
+        os.makedirs("/var/log/silentbridge", exist_ok=True)
+        os.makedirs("/var/run/silentbridge", exist_ok=True)
+        os.makedirs("/etc/silentbridge", exist_ok=True)
+        
+        # Set correct permissions for directories
+        os.chmod("/var/log/silentbridge", 0o755)
+        os.chmod("/var/run/silentbridge", 0o755)
+        os.chmod("/etc/silentbridge", 0o755)
+        
         # Reload systemd daemon
         os.system("systemctl daemon-reload")
         
         print("SilentBridge service installed successfully")
-        print("To enable and start the service, run:")
-        print("  sudo systemctl enable silentbridge")
+        print("\nTo start the service:")
         print("  sudo systemctl start silentbridge")
+        print("\nTo enable service on boot:")
+        print("  sudo systemctl enable silentbridge")
+        print("\nTo check service status:")
+        print("  sudo systemctl status silentbridge")
+        print("\nTo view logs:")
+        print("  sudo journalctl -u silentbridge")
         return True
     
     except Exception as e:
@@ -606,36 +635,58 @@ WantedBy=multi-user.target
         return False
 
 def main():
+    """Main entry point"""
     parser = argparse.ArgumentParser(description='SilentBridge Daemon')
     parser.add_argument('--nodaemon', action='store_true',
                        help='Run in foreground (do not daemonize)')
     parser.add_argument('--install-service', action='store_true',
                        help='Install SilentBridge as a system service')
+    parser.add_argument('--uninstall-service', action='store_true',
+                       help='Uninstall SilentBridge service')
     args = parser.parse_args()
-    
-    # Install service if requested
-    if args.install_service:
-        if os.geteuid() != 0:
-            print("Error: Service installation requires root privileges!")
-            sys.exit(1)
-        sys.exit(0 if install_service() else 1)
-    
-    # Check if already running
-    if is_daemon_running():
-        print("Error: SilentBridge daemon is already running")
-        sys.exit(1)
     
     # Check if running as root
     if os.geteuid() != 0:
         print("Error: This program must be run as root!")
         sys.exit(1)
     
+    # Handle service installation/uninstallation
+    if args.install_service:
+        sys.exit(0 if install_service() else 1)
+    elif args.uninstall_service:
+        try:
+            # Stop and disable the service
+            os.system("systemctl stop silentbridge")
+            os.system("systemctl disable silentbridge")
+            
+            # Remove service file
+            service_path = "/etc/systemd/system/silentbridge.service"
+            if os.path.exists(service_path):
+                os.unlink(service_path)
+            
+            # Reload systemd
+            os.system("systemctl daemon-reload")
+            
+            print("SilentBridge service uninstalled successfully")
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error uninstalling service: {e}")
+            sys.exit(1)
+    
+    # Check if already running
+    if is_daemon_running():
+        print("Error: SilentBridge daemon is already running")
+        sys.exit(1)
+    
+    # Set up daemon context
     daemon_context = daemon.DaemonContext(
         pidfile=daemon.pidfile.PIDLockFile(DEFAULT_PID_FILE),
         signal_map={
             signal.SIGTERM: lambda signo, frame: None,
             signal.SIGHUP: lambda signo, frame: None,
-        }
+        },
+        working_directory=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        umask=0o022,
     )
     
     if args.nodaemon:
@@ -644,9 +695,13 @@ def main():
         bridge_daemon.run()
     else:
         # Daemonize
-        with daemon_context:
-            bridge_daemon = SilentBridgeDaemon()
-            bridge_daemon.run()
+        try:
+            with daemon_context:
+                bridge_daemon = SilentBridgeDaemon()
+                bridge_daemon.run()
+        except Exception as e:
+            print(f"Error starting daemon: {e}")
+            sys.exit(1)
 
 if __name__ == '__main__':
     main() 
