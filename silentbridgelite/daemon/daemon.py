@@ -12,7 +12,7 @@ import daemon
 import daemon.pidfile
 from queue import Queue
 from scapy.all import Ether, EAPOL, DHCP, sniff, BOOTP, sendp
-from silentbridge_common import *
+from silentbridgelite.common.common import *
 
 class AnalysisThread(threading.Thread):
     """Thread for continuous network analysis"""
