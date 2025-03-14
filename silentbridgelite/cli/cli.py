@@ -6,7 +6,7 @@ import time
 import curses
 import threading
 from queue import Queue
-from silentbridge_common import *
+from silentbridgelite.common.common import *
 
 class LogWindow:
     """Window for displaying log messages"""
