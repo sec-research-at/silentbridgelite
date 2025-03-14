@@ -12,6 +12,7 @@ SilentBridge is a powerful 802.1x bypass tool that creates a transparent bridge 
 - Automatic cleanup and state restoration on failure
 - Support for 802.1x reauthentication forcing
 - Automatic tool installation for multiple package managers
+- Autostart configuration for system boot (systemd and SysVinit)
 
 ## Requirements
 
@@ -116,6 +117,21 @@ Clean up and destroy the bridge:
 python3 silentbridge.py destroy --bridge br0
 ```
 
+#### Configure Autostart
+
+Enable SilentBridge to start automatically at boot:
+
+```bash
+# Enable autostart with 'create' command (default)
+sudo python3 silentbridge.py autostart --enable --phy eth0 --upstream eth1
+
+# Enable autostart with 'autotakeover' command
+sudo python3 silentbridge.py autostart --enable --command autotakeover --interfaces eth0 eth1
+
+# Disable autostart
+sudo python3 silentbridge.py autostart --disable
+```
+
 ## Configuration
 
 SilentBridge automatically saves detected configurations to `~/.silentbridge`. This configuration can be reused with the `--use-stored-config` option.
@@ -149,6 +165,11 @@ SilentBridge automatically detects and uses the appropriate network stack:
    - Ensure Scapy is installed correctly
    - Check if interfaces are up
    - Verify promiscuous mode is supported
+
+4. If autostart doesn't work:
+   - Check system logs with `journalctl -u silentbridge` (systemd) or `/var/log/syslog` (SysVinit)
+   - Verify the service is enabled with `systemctl status silentbridge` (systemd) or `service silentbridge status` (SysVinit)
+   - Ensure the script path in the service file is correct
 
 ## Security Considerations
 

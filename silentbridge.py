@@ -90,6 +90,18 @@ class SilentBridge:
         takeover_parser.add_argument('--gateway-ip', required=True, help='Gateway IP address')
         takeover_parser.add_argument('--veth-name', default='veth0', help='Name for the virtual ethernet device')
         
+        # Autostart command
+        autostart_parser = subparsers.add_parser('autostart', help='Configure SilentBridge to start on boot')
+        autostart_group = autostart_parser.add_mutually_exclusive_group(required=True)
+        autostart_group.add_argument('--enable', action='store_true', help='Enable autostart on boot')
+        autostart_group.add_argument('--disable', action='store_true', help='Disable autostart on boot')
+        autostart_parser.add_argument('--command', choices=['create', 'autotakeover'], default='create', 
+                                     help='Command to run at startup (default: create)')
+        autostart_parser.add_argument('--bridge', default='br0', help='Bridge interface name')
+        autostart_parser.add_argument('--interfaces', nargs=2, help='Two ethernet interfaces to use (required for autotakeover)')
+        autostart_parser.add_argument('--phy', help='Interface connected to the client (required for create)')
+        autostart_parser.add_argument('--upstream', help='Upstream interface (required for create)')
+        
         return parser
     
     def run(self):
@@ -119,6 +131,8 @@ class SilentBridge:
             self.takeover_client()
         elif self.args.command == 'autotakeover':
             self.autotakeover()
+        elif self.args.command == 'autostart':
+            self.configure_autostart()
         else:
             self.parser.print_help()
     
@@ -1032,7 +1046,7 @@ class SilentBridge:
             
             # Step 4: Wait for client authentication and DHCP
             print("[*] Waiting for client authentication and DHCP...")
-            time.sleep(5)  # Give the bridge time to stabilize
+            time.sleep(10)  # Give the bridge time to stabilize
             
             # Update config with client information
             self.args = analysis_args
@@ -1281,6 +1295,283 @@ class SilentBridge:
                 return
         
         print("\n[+] All required tools have been installed successfully!")
+
+    def configure_autostart(self):
+        """Configure SilentBridge to start on boot"""
+        if self.args.enable:
+            print("[*] Enabling SilentBridge autostart on boot...")
+        else:
+            print("[*] Disabling SilentBridge autostart on boot...")
+        
+        # Check if running as root
+        if os.geteuid() != 0:
+            print("[!] This command must be run as root!")
+            return
+        
+        # Determine init system
+        init_system = self.detect_init_system()
+        if not init_system:
+            print("[!] Could not detect init system!")
+            return
+        
+        print(f"[*] Detected init system: {init_system}")
+        
+        if self.args.enable:
+            # Validate arguments based on command
+            if self.args.command == 'create':
+                if not self.args.phy or not self.args.upstream:
+                    print("[!] For 'create' command, --phy and --upstream arguments are required!")
+                    return
+            elif self.args.command == 'autotakeover':
+                if not self.args.interfaces or len(self.args.interfaces) != 2:
+                    print("[!] For 'autotakeover' command, --interfaces argument with two interfaces is required!")
+                    return
+            
+            # Create autostart configuration
+            if init_system == 'systemd':
+                self.configure_systemd_autostart()
+            elif init_system == 'sysvinit':
+                self.configure_sysvinit_autostart()
+            else:
+                print(f"[!] Autostart configuration for {init_system} is not supported!")
+                return
+        else:
+            # Disable autostart
+            if init_system == 'systemd':
+                self.disable_systemd_autostart()
+            elif init_system == 'sysvinit':
+                self.disable_sysvinit_autostart()
+            else:
+                print(f"[!] Autostart configuration for {init_system} is not supported!")
+                return
+    
+    def detect_init_system(self):
+        """Detect the system's init system"""
+        # Check for systemd
+        if os.path.exists('/run/systemd/system'):
+            return 'systemd'
+        
+        # Check for SysVinit
+        if os.path.exists('/etc/init.d'):
+            return 'sysvinit'
+        
+        # Check for OpenRC (used by Gentoo, Alpine)
+        if os.path.exists('/etc/init.d/openrc'):
+            return 'openrc'
+        
+        return None
+    
+    def configure_systemd_autostart(self):
+        """Configure autostart using systemd"""
+        # Create service file
+        service_name = 'silentbridge.service'
+        service_path = '/etc/systemd/system/' + service_name
+        
+        # Get script path
+        script_path = os.path.abspath(sys.argv[0])
+        
+        # Build command based on selected command
+        if self.args.command == 'create':
+            cmd = f"{script_path} create --bridge {self.args.bridge} --phy {self.args.phy} --upstream {self.args.upstream}"
+            if getattr(self.args, 'use_legacy', False):
+                cmd += " --use-legacy"
+        else:  # autotakeover
+            cmd = f"{script_path} autotakeover --interfaces {' '.join(self.args.interfaces)} --bridge {self.args.bridge}"
+        
+        # Create service file content
+        service_content = f"""[Unit]
+Description=SilentBridge 802.1x Bypass Tool
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={cmd}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+        
+        try:
+            # Write service file
+            with open(service_path, 'w') as f:
+                f.write(service_content)
+            
+            print(f"[*] Created systemd service file: {service_path}")
+            
+            # Enable and start the service
+            self.run_command(f"systemctl daemon-reload")
+            self.run_command(f"systemctl enable {service_name}")
+            
+            print("[+] SilentBridge autostart has been enabled!")
+            print(f"[*] Service will run: {cmd}")
+            print("[*] You can manually start it with:")
+            print(f"    systemctl start {service_name}")
+            
+        except Exception as e:
+            print(f"[!] Error configuring systemd autostart: {e}")
+    
+    def disable_systemd_autostart(self):
+        """Disable autostart using systemd"""
+        service_name = 'silentbridge.service'
+        service_path = '/etc/systemd/system/' + service_name
+        
+        try:
+            # Check if service exists
+            if not os.path.exists(service_path):
+                print("[!] SilentBridge systemd service is not installed!")
+                return
+            
+            # Disable and stop the service
+            self.run_command(f"systemctl stop {service_name}", ignore_errors=True)
+            self.run_command(f"systemctl disable {service_name}")
+            
+            # Remove service file
+            os.remove(service_path)
+            self.run_command(f"systemctl daemon-reload")
+            
+            print("[+] SilentBridge autostart has been disabled!")
+            
+        except Exception as e:
+            print(f"[!] Error disabling systemd autostart: {e}")
+    
+    def configure_sysvinit_autostart(self):
+        """Configure autostart using SysVinit"""
+        # Create init script
+        init_script_name = 'silentbridge'
+        init_script_path = '/etc/init.d/' + init_script_name
+        
+        # Get script path
+        script_path = os.path.abspath(sys.argv[0])
+        
+        # Build command based on selected command
+        if self.args.command == 'create':
+            cmd = f"{script_path} create --bridge {self.args.bridge} --phy {self.args.phy} --upstream {self.args.upstream}"
+            if getattr(self.args, 'use_legacy', False):
+                cmd += " --use-legacy"
+        else:  # autotakeover
+            cmd = f"{script_path} autotakeover --interfaces {' '.join(self.args.interfaces)} --bridge {self.args.bridge}"
+        
+        # Create init script content
+        init_script_content = f"""#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          silentbridge
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: SilentBridge 802.1x Bypass Tool
+# Description:       Starts the SilentBridge 802.1x Bypass Tool
+### END INIT INFO
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+DESC="SilentBridge 802.1x Bypass Tool"
+NAME=silentbridge
+DAEMON={cmd}
+PIDFILE=/var/run/$NAME.pid
+
+case "$1" in
+  start)
+    echo "Starting $DESC"
+    $DAEMON &
+    echo $! > $PIDFILE
+    ;;
+  stop)
+    echo "Stopping $DESC"
+    if [ -f $PIDFILE ]; then
+        PID=$(cat $PIDFILE)
+        kill -TERM $PID
+        rm $PIDFILE
+    else
+        echo "$NAME is not running"
+    fi
+    ;;
+  restart|force-reload)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+  status)
+    if [ -f $PIDFILE ]; then
+        PID=$(cat $PIDFILE)
+        if ps -p $PID > /dev/null; then
+            echo "$NAME is running"
+            exit 0
+        else
+            echo "$NAME is not running (stale PID file)"
+            exit 1
+        fi
+    else
+        echo "$NAME is not running"
+        exit 3
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|force-reload|status}"
+    exit 1
+    ;;
+esac
+
+exit 0
+"""
+        
+        try:
+            # Write init script
+            with open(init_script_path, 'w') as f:
+                f.write(init_script_content)
+            
+            # Make it executable
+            os.chmod(init_script_path, 0o755)
+            
+            print(f"[*] Created SysVinit script: {init_script_path}")
+            
+            # Enable the script
+            if os.path.exists('/usr/sbin/update-rc.d'):
+                self.run_command(f"update-rc.d {init_script_name} defaults")
+            elif os.path.exists('/sbin/chkconfig'):
+                self.run_command(f"chkconfig --add {init_script_name}")
+                self.run_command(f"chkconfig {init_script_name} on")
+            else:
+                print("[!] Could not enable init script automatically!")
+                print(f"[*] Please manually enable {init_script_path}")
+            
+            print("[+] SilentBridge autostart has been enabled!")
+            print(f"[*] Service will run: {cmd}")
+            print("[*] You can manually start it with:")
+            print(f"    service {init_script_name} start")
+            
+        except Exception as e:
+            print(f"[!] Error configuring SysVinit autostart: {e}")
+    
+    def disable_sysvinit_autostart(self):
+        """Disable autostart using SysVinit"""
+        init_script_name = 'silentbridge'
+        init_script_path = '/etc/init.d/' + init_script_name
+        
+        try:
+            # Check if init script exists
+            if not os.path.exists(init_script_path):
+                print("[!] SilentBridge init script is not installed!")
+                return
+            
+            # Disable the script
+            if os.path.exists('/usr/sbin/update-rc.d'):
+                self.run_command(f"update-rc.d -f {init_script_name} remove")
+            elif os.path.exists('/sbin/chkconfig'):
+                self.run_command(f"chkconfig {init_script_name} off")
+                self.run_command(f"chkconfig --del {init_script_name}")
+            
+            # Stop the service
+            self.run_command(f"service {init_script_name} stop", ignore_errors=True)
+            
+            # Remove init script
+            os.remove(init_script_path)
+            
+            print("[+] SilentBridge autostart has been disabled!")
+            
+        except Exception as e:
+            print(f"[!] Error disabling SysVinit autostart: {e}")
 
 if __name__ == "__main__":
     bridge = SilentBridge()
