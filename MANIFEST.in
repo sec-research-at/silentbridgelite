@@ -1,0 +1,6 @@
+include LICENSE
+include readme.md
+include requirements.txt
+recursive-include cli *.py
+recursive-include common *.py
+recursive-include daemon *.py 

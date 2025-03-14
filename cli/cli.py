@@ -6,7 +6,7 @@ import time
 import curses
 import threading
 from queue import Queue
-from silentbridge_common import *
+from common.common import *
 
 class LogWindow:
     """Window for displaying log messages"""
@@ -252,11 +252,26 @@ class SilentBridgeCLI:
         # Get screen dimensions
         self.height, self.width = self.stdscr.getmaxyx()
         
+        # Define minimum dimensions
+        min_height = 35  # Minimum height needed
+        min_width = 80   # Minimum width needed
+        
+        if self.height < min_height or self.width < min_width:
+            curses.endwin()
+            print(f"Terminal window too small. Minimum size required: {min_width}x{min_height}")
+            print(f"Current size: {self.width}x{self.height}")
+            sys.exit(1)
+            
         # Create windows
         menu_height = 12
         overview_height = 10
         status_height = 8
         log_height = self.height - menu_height - status_height - overview_height
+        
+        # Ensure we have at least some space for logs
+        if log_height < 5:
+            log_height = 5
+            status_height = max(3, self.height - menu_height - overview_height - log_height)
         
         self.menu_win = MenuWindow(menu_height, self.width, 0, 0)
         self.overview_win = OverviewWindow(overview_height, self.width, menu_height, 0)
