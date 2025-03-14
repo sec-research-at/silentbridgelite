@@ -153,6 +153,89 @@ class MenuWindow:
         
         self.window.refresh()
 
+class OverviewWindow:
+    """Window for displaying bridge overview"""
+    def __init__(self, height, width, y, x):
+        self.window = curses.newwin(height, width, y, x)
+        self.height = height
+        self.width = width
+        self.status = {}
+        self.window.box()
+        self.window.addstr(0, 2, "Overview")
+        self.window.refresh()
+    
+    def update_status(self, status):
+        """Update status information"""
+        self.status = status
+        self.refresh()
+    
+    def refresh(self):
+        """Refresh the overview window"""
+        self.window.clear()
+        self.window.box()
+        self.window.addstr(0, 2, "Overview")
+        
+        if not self.status:
+            return
+        
+        # Get status information
+        config = self.status.get('config', {})
+        bridge_status = self.status.get('bridge_status', 'NOT_CREATED')
+        analysis_results = self.status.get('analysis_results', {})
+        
+        # Client box (left)
+        client_y, client_x = 2, 2
+        self.window.addstr(client_y, client_x, "┌─ Client ─────────┐")
+        self.window.addstr(client_y + 1, client_x, "│ Status:         │")
+        self.window.addstr(client_y + 2, client_x, "│ MAC:            │")
+        self.window.addstr(client_y + 3, client_x, "│ IP:             │")
+        self.window.addstr(client_y + 4, client_x, "│ DHCP: Y/N       │")
+        self.window.addstr(client_y + 5, client_x, "└─────────────────┘")
+        
+        # Bridge box (middle)
+        bridge_y, bridge_x = 2, 25
+        self.window.addstr(bridge_y, bridge_x, "┌─ Bridge ─────────┐")
+        self.window.addstr(bridge_y + 1, bridge_x, "│                 │")
+        self.window.addstr(bridge_y + 2, bridge_x, "│    $ethX        │")
+        self.window.addstr(bridge_y + 3, bridge_x, "│   Up/Down       │")
+        self.window.addstr(bridge_y + 4, bridge_x, "│    $ethY        │")
+        self.window.addstr(bridge_y + 5, bridge_x, "│   Up/Down       │")
+        self.window.addstr(bridge_y + 6, bridge_x, "└─────────────────┘")
+        
+        # Network box (right)
+        network_y, network_x = 2, 48
+        self.window.addstr(network_y, network_x, "┌─ Network ────────┐")
+        self.window.addstr(network_y + 1, network_x, "│ Status:         │")
+        self.window.addstr(network_y + 2, network_x, "│ MAC:            │")
+        self.window.addstr(network_y + 3, network_x, "│ IP CIDR:        │")
+        self.window.addstr(network_y + 4, network_x, "│ GW:             │")
+        self.window.addstr(network_y + 5, network_x, "└─────────────────┘")
+        
+        # Fill in values
+        # Client status
+        client_status = "CONNECTED" if analysis_results.get('client_mac') else "WAITING"
+        self.window.addstr(client_y + 1, client_x + 9, f"{client_status:<10}")
+        if analysis_results.get('client_mac'):
+            self.window.addstr(client_y + 2, client_x + 6, f"{analysis_results['client_mac']:<12}")
+        if analysis_results.get('client_ip'):
+            self.window.addstr(client_y + 3, client_x + 5, f"{analysis_results['client_ip']:<14}")
+        
+        # Bridge status
+        phy_interface = config.get('phy_interface', 'N/A')
+        upstream_interface = config.get('upstream_interface', 'N/A')
+        self.window.addstr(bridge_y + 2, bridge_x + 5, f"{phy_interface:<8}")
+        self.window.addstr(bridge_y + 4, bridge_x + 5, f"{upstream_interface:<8}")
+        
+        # Network status
+        network_status = "CONNECTED" if analysis_results.get('router_mac') else "WAITING"
+        self.window.addstr(network_y + 1, network_x + 9, f"{network_status:<10}")
+        if analysis_results.get('router_mac'):
+            self.window.addstr(network_y + 2, network_x + 6, f"{analysis_results['router_mac']:<12}")
+        if analysis_results.get('router_ip'):
+            self.window.addstr(network_y + 3, network_x + 11, f"{analysis_results['router_ip']:<8}")
+        
+        self.window.refresh()
+
 class SilentBridgeCLI:
     """Main CLI class"""
     def __init__(self, stdscr):
@@ -171,12 +254,14 @@ class SilentBridgeCLI:
         
         # Create windows
         menu_height = 12
+        overview_height = 10
         status_height = 8
-        log_height = self.height - menu_height - status_height
+        log_height = self.height - menu_height - status_height - overview_height
         
         self.menu_win = MenuWindow(menu_height, self.width, 0, 0)
-        self.status_win = StatusWindow(status_height, self.width, menu_height, 0)
-        self.log_win = LogWindow(log_height, self.width, menu_height + status_height, 0)
+        self.overview_win = OverviewWindow(overview_height, self.width, menu_height, 0)
+        self.status_win = StatusWindow(status_height, self.width, menu_height + overview_height, 0)
+        self.log_win = LogWindow(log_height, self.width, menu_height + overview_height + status_height, 0)
         
         # Hide cursor
         curses.curs_set(0)
@@ -193,7 +278,15 @@ class SilentBridgeCLI:
                 # Update status
                 response = self.client.get_status()
                 if response and response.status == StatusCode.SUCCESS:
-                    self.status_win.update_status(response.data)
+                    status_data = response.data
+                    
+                    # Get analysis results
+                    analysis_response = self.client.get_analysis_results()
+                    if analysis_response and analysis_response.status == StatusCode.SUCCESS:
+                        status_data['analysis_results'] = analysis_response.data['results']
+                    
+                    self.status_win.update_status(status_data)
+                    self.overview_win.update_status(status_data)
                 
                 # Update logs
                 response = self.client.get_logs(lines=10)

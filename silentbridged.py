@@ -431,11 +431,63 @@ class SilentBridgeDaemon:
         # Implementation of restart logic here
         return Message(CommandType.RESTART)
 
+def install_service():
+    """Install SilentBridge as a system service"""
+    # Get the absolute path of the script
+    script_path = os.path.abspath(__file__)
+    
+    # Create systemd service file
+    service_content = f"""[Unit]
+Description=SilentBridge Daemon
+After=network.target
+
+[Service]
+Type=forking
+ExecStart={sys.executable} {script_path}
+PIDFile={DEFAULT_PID_FILE}
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+"""
+    
+    # Write service file
+    service_path = "/etc/systemd/system/silentbridge.service"
+    try:
+        with open(service_path, 'w') as f:
+            f.write(service_content)
+        
+        # Set correct permissions
+        os.chmod(service_path, 0o644)
+        
+        # Reload systemd daemon
+        os.system("systemctl daemon-reload")
+        
+        print("SilentBridge service installed successfully")
+        print("To enable and start the service, run:")
+        print("  sudo systemctl enable silentbridge")
+        print("  sudo systemctl start silentbridge")
+        return True
+    
+    except Exception as e:
+        print(f"Error installing service: {e}")
+        return False
+
 def main():
     parser = argparse.ArgumentParser(description='SilentBridge Daemon')
     parser.add_argument('--nodaemon', action='store_true',
                        help='Run in foreground (do not daemonize)')
+    parser.add_argument('--install-service', action='store_true',
+                       help='Install SilentBridge as a system service')
     args = parser.parse_args()
+    
+    # Install service if requested
+    if args.install_service:
+        if os.geteuid() != 0:
+            print("Error: Service installation requires root privileges!")
+            sys.exit(1)
+        sys.exit(0 if install_service() else 1)
     
     # Check if already running
     if is_daemon_running():
