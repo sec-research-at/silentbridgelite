@@ -1,8 +1,3 @@
-python-daemon>=2.3.0
 scapy>=2.4.5
 netifaces>=0.11.0
-pyroute2>=0.7.3
-wheel>=0.37.0
-setuptools>=65.5.1
-build>=0.10.0
 nanpy
